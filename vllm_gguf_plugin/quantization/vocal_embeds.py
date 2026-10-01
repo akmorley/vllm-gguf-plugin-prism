@@ -16,7 +16,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
-from .linear import GGUFLinearMethod
+from ..hadamard import HadamardRuntimeConfig, PrismHadamardConfig, apply_inverse_hadamard
+from .linear import (
+    GGUFLinearMethod,
+)
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
@@ -123,6 +126,31 @@ except AttributeError as error:
 class GGUFEmbeddingMethod(GGUFLinearMethod):
     """Embedding method for GGUF."""
 
+    def __init__(
+        self,
+        quant_config,
+        inverse_hadamard_config: PrismHadamardConfig | None = None,
+        hadamard_runtime_config: HadamardRuntimeConfig | None = None,
+    ):
+
+        # ParallelLMHead uses the inherited GGUFLinearMethod.apply().
+        #
+        # Therefore the forward-Hadamard state must be installed
+        # in the base linear method.
+        super().__init__(
+            quant_config,
+            layout=None,
+            hadamard_runtime_config=hadamard_runtime_config,
+        )
+
+
+        self.inverse_hadamard_config = (
+            inverse_hadamard_config
+        )
+
+
+
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -189,9 +217,21 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         weight = layer.weight
         weight_type = layer.weight_type.weight_type
         hidden_size = weight.tensor_shape[1]
-        return apply_gguf_embedding_op(
+        out = apply_gguf_embedding_op(
             x, weight, weight_type, hidden_size, dtype=self.params_dtype
         )
+
+
+        if (
+            self.inverse_hadamard_config
+            is not None
+        ):
+            out = apply_inverse_hadamard(
+                out,
+                self.inverse_hadamard_config,
+            )
+
+        return out
 
     def tie_weights(self, layer: torch.nn.Module, embed_tokens: VocabParallelEmbedding):
         del layer

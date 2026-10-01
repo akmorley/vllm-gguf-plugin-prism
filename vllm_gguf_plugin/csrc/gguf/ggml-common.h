@@ -190,6 +190,24 @@ typedef struct {
     uint8_t  qs[QK_K/2];
 } block_iq4_xs;
 
+
+
+
+#define QK_PQ2_0 128
+#define QI_PQ2_0 (QK_PQ2_0 / 32)
+#define QR_PQ2_0 1
+
+typedef struct {
+    half d;
+    uint8_t qs[QK_PQ2_0 / 4];
+} block_pq2_0;
+
+static_assert(
+    sizeof(block_pq2_0) == sizeof(half) + QK_PQ2_0 / 4,
+    "wrong pq2_0 block size"
+);
+
+
 static const __device__ uint64_t iq2xxs_grid[256] = {
     0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
     0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,

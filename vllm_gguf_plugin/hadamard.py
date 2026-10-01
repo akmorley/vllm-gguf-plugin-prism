@@ -109,7 +109,7 @@ class PrismHadamardConfig:
 class HadamardRuntimeConfig:
     config: PrismHadamardConfig
     permutation: HadamardPermutation | None = None
-    layout_already_consumed: bool = False
+    skip_input_layout: bool = False
 
 
 
@@ -601,8 +601,7 @@ def fwht_blockwise(
 
 def apply_forward_hadamard(
     x: torch.Tensor,
-    config: HadamardConfig,
-    permutation: HadamardPermutation | None = None,
+    config: PrismHadamardConfig,
 ) -> torch.Tensor:
     # `permutation` is intentionally ignored on the runtime
     # activation path.
@@ -613,11 +612,7 @@ def apply_forward_hadamard(
     # post-permutation activation order.
 
         
-    signs = _get_signs_for_width(
-        config,
-        x.shape[-1],
-    )
-
+    signs = _get_signs_for_width(config,x.shape[-1])
 
     if signs is not None:
         signs = signs.to(
@@ -627,10 +622,7 @@ def apply_forward_hadamard(
 
         x = x * signs
 
-    x =  fwht_blockwise(
-        x,
-        config.block_size,
-    )
+    x =  fwht_blockwise(x,config.block_size)
 
     return x
 

@@ -7,6 +7,7 @@ import torch
 
 from vllm_gguf_plugin.hadamard import (
     HadamardPermutation,
+    HadamardRuntimeConfig,
     PrismHadamardConfig,
 )
 from vllm_gguf_plugin.loader import (
@@ -24,9 +25,7 @@ def make_hadamard_config(
     return PrismHadamardConfig(
         version=2 if tied_output else 1,
         block_size=1024,
-        transform=(
-            "normalized-sylvester-walsh-hadamard"
-        ),
+        transform=("normalized-sylvester-walsh-hadamard"),
         axis="input-last-dimension",
         sign_mode="identity",
         weight_names={
@@ -47,17 +46,14 @@ def make_loader_without_init() -> GGUFModelLoader:
     _weight_name_to_module_name() does not depend on initialized
     loader state, so avoid invoking GGUFModelLoader.__init__.
     """
-    return object.__new__(
-        GGUFModelLoader
-    )
+    return object.__new__(GGUFModelLoader)
 
 
 def test_weight_name_to_module_name():
     loader = make_loader_without_init()
 
     name_map = {
-        "blk.0.attn_q.weight":
-            "model.layers.0.self_attn.q_proj.weight",
+        "blk.0.attn_q.weight": "model.layers.0.self_attn.q_proj.weight",
     }
 
     got = loader._weight_name_to_module_name(
@@ -65,17 +61,14 @@ def test_weight_name_to_module_name():
         name_map,
     )
 
-    assert got == (
-        "model.layers.0.self_attn.q_proj"
-    )
+    assert got == ("model.layers.0.self_attn.q_proj")
 
 
 def test_output_weight_maps_to_module_prefix():
     loader = make_loader_without_init()
 
     name_map = {
-        "output.weight":
-            "lm_head.weight",
+        "output.weight": "lm_head.weight",
     }
 
     got = loader._weight_name_to_module_name(
@@ -90,8 +83,7 @@ def test_embedding_weight_maps_to_module_prefix():
     loader = make_loader_without_init()
 
     name_map = {
-        "token_embd.weight":
-            "model.embed_tokens.weight",
+        "token_embd.weight": "model.embed_tokens.weight",
     }
 
     got = loader._weight_name_to_module_name(
@@ -119,8 +111,7 @@ def test_weight_name_must_map_to_weight():
     loader = make_loader_without_init()
 
     name_map = {
-        "blk.0.attn_q.weight":
-            "model.layers.0.self_attn.q_proj.bias",
+        "blk.0.attn_q.weight": "model.layers.0.self_attn.q_proj.bias",
     }
 
     with pytest.raises(
@@ -197,21 +188,20 @@ def test_config_register_hadamard():
     )
 
     forward_modules = {
-        "model.layers.0.ssm_out":
-            permutation,
-
-        # None does NOT mean "no Hadamard".
+        "language_model.model.layers.0.ssm_out": HadamardRuntimeConfig(
+            hcfg, permutation
+        ),
+        # A runtime with no permutation still enables Hadamard.
         #
         # It means:
         #
         #   forward Hadamard required,
         #   no GDN permutation required.
-        "lm_head":
-            None,
+        "language_model.lm_head": HadamardRuntimeConfig(hcfg),
     }
 
     inverse_modules = {
-        "model.embed_tokens",
+        "language_model.model.embed_tokens",
     }
 
     config.register_hadamard(
@@ -224,27 +214,16 @@ def test_config_register_hadamard():
 
     assert (
         config.hadamard_forward_modules[
-            "model.layers.0.ssm_out"
-        ]
+            "language_model.model.layers.0.ssm_out"
+        ].permutation
         == permutation
     )
 
-    assert (
-        "lm_head"
-        in config.hadamard_forward_modules
-    )
+    assert "language_model.lm_head" in config.hadamard_forward_modules
 
-    assert (
-        config.hadamard_forward_modules[
-            "lm_head"
-        ]
-        is None
-    )
+    assert config.hadamard_forward_modules["language_model.lm_head"].permutation is None
 
-    assert (
-        "model.embed_tokens"
-        in config.hadamard_inverse_modules
-    )
+    assert "language_model.model.embed_tokens" in config.hadamard_inverse_modules
 
 
 def test_none_permutation_does_not_mean_no_hadamard():
@@ -253,7 +232,7 @@ def test_none_permutation_does_not_mean_no_hadamard():
 
     Dictionary entry:
 
-        "lm_head": None
+        "language_model.lm_head": HadamardRuntimeConfig(hcfg)
 
     means:
 
@@ -271,23 +250,16 @@ def test_none_permutation_does_not_mean_no_hadamard():
     config.register_hadamard(
         hcfg,
         {
-            "lm_head": None,
+            "language_model.lm_head": HadamardRuntimeConfig(hcfg),
         },
         set(),
     )
 
-    assert (
-        "lm_head"
-        in config.hadamard_forward_modules
-    )
+    assert "language_model.lm_head" in config.hadamard_forward_modules
 
-    permutation = (
-        config.hadamard_forward_modules[
-            "lm_head"
-        ]
-    )
+    permutation = config.hadamard_forward_modules["language_model.lm_head"]
 
-    assert permutation is None
+    assert permutation.permutation is None
 
 
 def test_missing_prefix_means_no_forward_hadamard():
@@ -298,15 +270,12 @@ def test_missing_prefix_means_no_forward_hadamard():
     config.register_hadamard(
         hcfg,
         {
-            "lm_head": None,
+            "language_model.lm_head": HadamardRuntimeConfig(hcfg),
         },
         set(),
     )
 
-    assert (
-        "model.layers.0.ffn"
-        not in config.hadamard_forward_modules
-    )
+    assert "language_model.model.layers.0.ffn" not in config.hadamard_forward_modules
 
 
 def test_forward_and_inverse_module_sets_are_independent():
@@ -317,32 +286,20 @@ def test_forward_and_inverse_module_sets_are_independent():
     config.register_hadamard(
         hcfg,
         {
-            "lm_head": None,
+            "language_model.lm_head": HadamardRuntimeConfig(hcfg),
         },
         {
-            "model.embed_tokens",
+            "language_model.model.embed_tokens",
         },
     )
 
-    assert (
-        "lm_head"
-        in config.hadamard_forward_modules
-    )
+    assert "language_model.lm_head" in config.hadamard_forward_modules
 
-    assert (
-        "lm_head"
-        not in config.hadamard_inverse_modules
-    )
+    assert "language_model.lm_head" not in config.hadamard_inverse_modules
 
-    assert (
-        "model.embed_tokens"
-        in config.hadamard_inverse_modules
-    )
+    assert "language_model.model.embed_tokens" in config.hadamard_inverse_modules
 
-    assert (
-        "model.embed_tokens"
-        not in config.hadamard_forward_modules
-    )
+    assert "language_model.model.embed_tokens" not in config.hadamard_forward_modules
 
 
 def test_gdn_module_retains_permutation():
@@ -356,30 +313,22 @@ def test_gdn_module_retains_permutation():
         rep=2,
     )
 
-    prefix = (
-        "model.layers.0.linear_attn."
-        "out_proj"
-    )
+    prefix = "language_model.model.layers.0.linear_attn.out_proj"
 
     config.register_hadamard(
         hcfg,
         {
-            prefix:
-                permutation,
+            prefix: HadamardRuntimeConfig(hcfg, permutation),
         },
         set(),
     )
 
-    got = (
-        config.hadamard_forward_modules[
-            prefix
-        ]
-    )
+    got = config.hadamard_forward_modules[prefix]
 
     assert got is not None
-    assert got.hd == 256
-    assert got.nk == 8
-    assert got.rep == 2
+    assert got.permutation.hd == 256
+    assert got.permutation.nk == 8
+    assert got.permutation.rep == 2
 
 
 def test_untied_output_is_explicit_forward_module():
@@ -396,17 +345,14 @@ def test_untied_output_is_explicit_forward_module():
     )
 
     name_map = {
-        "output.weight":
-            "lm_head.weight",
+        "output.weight": "lm_head.weight",
     }
 
     assert "output.weight" in hcfg.weight_names
 
-    module_name = (
-        loader._weight_name_to_module_name(
-            "output.weight",
-            name_map,
-        )
+    module_name = loader._weight_name_to_module_name(
+        "output.weight",
+        name_map,
     )
 
     assert module_name == "lm_head"
@@ -418,26 +364,17 @@ def test_inverse_embedding_maps_to_embed_tokens():
     hcfg = make_hadamard_config()
 
     name_map = {
-        "token_embd.weight":
-            "model.embed_tokens.weight",
+        "token_embd.weight": "model.embed_tokens.weight",
     }
 
-    assert (
-        "token_embd.weight"
-        in hcfg.inverse_weight_names
+    assert "token_embd.weight" in hcfg.inverse_weight_names
+
+    module_name = loader._weight_name_to_module_name(
+        "token_embd.weight",
+        name_map,
     )
 
-    module_name = (
-        loader._weight_name_to_module_name(
-            "token_embd.weight",
-            name_map,
-        )
-    )
-
-    assert (
-        module_name
-        == "model.embed_tokens"
-    )
+    assert module_name == "model.embed_tokens"
 
 
 def test_hadamard_sign_tensor_is_cpu_until_used():
@@ -449,9 +386,7 @@ def test_hadamard_sign_tensor_is_cpu_until_used():
     hcfg = PrismHadamardConfig(
         version=1,
         block_size=4,
-        transform=(
-            "normalized-sylvester-walsh-hadamard"
-        ),
+        transform=("normalized-sylvester-walsh-hadamard"),
         axis="input-last-dimension",
         sign_mode="explicit",
         weight_names=set(),
@@ -463,12 +398,6 @@ def test_hadamard_sign_tensor_is_cpu_until_used():
         tied_output=False,
     )
 
-    assert (
-        hcfg.signs_by_width[4].device.type
-        == "cpu"
-    )
+    assert hcfg.signs_by_width[4].device.type == "cpu"
 
-    assert (
-        hcfg.signs_by_width[4].dtype
-        == torch.int8
-    )
+    assert hcfg.signs_by_width[4].dtype == torch.int8

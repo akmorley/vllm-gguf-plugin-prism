@@ -18,6 +18,8 @@ from vllm.model_executor.model_loader.utils import (
 )
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+
+from gguf import GGUFReader
 from .gguf_files import GGUFModelFiles
 from .gguf_utils import (
     detect_gguf_multimodal,
@@ -42,11 +44,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+from .hadamard import (
+    PrismHadamardConfig,
+    HadamardRuntimeConfig,
+    HadamardPermutation,
+    read_prism_hadamard_config,
+)
+
 class GGUFLoadPlan(NamedTuple):
     files: GGUFModelFiles
     name_map: dict[str, str]
     unquantized_modules: tuple[str, ...]
     linear_layouts: dict[str, GGUFLinearLayout]
+
+    hadamard_config: PrismHadamardConfig | None
+
+    # Keys are vLLM module names, without ".weight"
+    hadamard_forward_modules: dict[str, HadamardRuntimeConfig]
+
+    # Usually just token_embd / embed_tokens
+    hadamard_inverse_modules: set[str]
+
 
 
 def _revision_for_weights_repo(
@@ -156,30 +174,192 @@ class GGUFModelLoader(BaseModelLoader):
             mm_proj=mm_proj,
         )
 
+    def _weight_name_to_module_name(
+        self,
+        gguf_name: str,
+        name_map: dict[str, str],
+    ) -> str:
+        try:
+            mapped = name_map[gguf_name]
+        except KeyError as exc:
+            raise ValueError(
+                f"Prism Hadamard weight {gguf_name!r} "
+                "is not present in the GGUF name map"
+            ) from exc
+
+        if not mapped.endswith(".weight"):
+            raise ValueError(
+                f"Prism Hadamard tensor {gguf_name!r} maps to "
+                f"{mapped!r}, which is not a weight parameter"
+            )
+
+        return mapped.removesuffix(".weight")
+
     def _prepare_adapter(
-        self, model_config: ModelConfig
+        self,
+        model_config: ModelConfig,
     ) -> tuple[BaseGGUFWeightsAdapter, GGUFLoadPlan]:
         files = self._prepare_model_files(model_config)
-        adapter = get_weights_adapter(model_config.hf_config)
+        adapter = get_weights_adapter( model_config.hf_config)
+
         model_config.hf_config = adapter.patch_hf_config(
             files,
             model_config.hf_config,
         )
 
         text_config = model_config.hf_config.get_text_config()
+
         backbone_names = get_gguf_tensor_names(files.backbone)
+
         text_config.update(
-            {"tie_word_embeddings": "output.weight" not in backbone_names}
+            {
+                "tie_word_embeddings":
+                    "output.weight" not in backbone_names
+            }
         )
 
-        name_map = adapter.build_name_map(files, model_config)
-        unquantized_modules = _get_unquantized_modules(files, name_map) + tuple(
-            adapter.extra_unquantized_modules
+        # ---------------------------------------------------------
+        # Build the GGUF -> vLLM parameter mapping first.
+        # Hadamard metadata contains GGUF tensor names.
+        # ---------------------------------------------------------
+
+        name_map = adapter.build_name_map(files,model_config,)
+
+        # ---------------------------------------------------------
+        # Parse Prism Hadamard metadata.
+        # Ordinary GGUF models return None here.
+        # ---------------------------------------------------------
+
+        hcfg = read_prism_hadamard_config(files.backbone[0])
+
+        # Keys here are vLLM *module prefixes*, not parameter names.
+        #
+        # Example:
+        #
+        #   GGUF:
+        #       blk.0.attn_q.weight
+        #
+        #   name_map:
+        #       model.layers.0.self_attn.q_proj.weight
+        #
+        #   module key:
+        #       model.layers.0.self_attn.q_proj
+        #
+        hadamard_forward_modules: dict[str, HadamardRuntimeConfig] = {}
+        hadamard_inverse_modules: set[str] = set()
+
+        # ---------------------------------------------------------
+        # Forward/folded weights
+        # ---------------------------------------------------------
+        if hcfg is not None:
+            reader = GGUFReader(str(files.backbone[0]))
+
+            gguf_shapes = {
+                tensor.name: tuple(
+                    int(v) for v in tensor.shape
+                )
+                for tensor in reader.tensors
+            }
+
+            n_k = getattr(text_config, "linear_num_key_heads", None)
+            n_v = getattr(text_config,"linear_num_value_heads",None,)
+
+            for gguf_name in hcfg.weight_names:
+                module_name = self._weight_name_to_module_name(gguf_name,name_map)
+
+                permutation = None
+                skip_input_layout = False
+
+                if hcfg.gdn_v_grouped and ".ssm_out." in gguf_name:
+                    if n_k is None or n_v is None:
+                        raise ValueError(
+                            "Prism GDN V grouping requires "
+                            "linear_num_key_heads and "
+                            "linear_num_value_heads"
+                        )
+
+                    if n_v % n_k != 0:
+                        raise ValueError(
+                            f"invalid GDN heads: "
+                            f"n_v={n_v}, n_k={n_k}"
+                        )
+
+                    try:
+                        shape = gguf_shapes[gguf_name]
+                    except KeyError as exc:
+                        raise ValueError(
+                            f"Hadamard GGUF tensor not found: "
+                            f"{gguf_name}"
+                        ) from exc
+
+                    input_width = int(shape[0])
+
+                    if input_width % n_v != 0:
+                        raise ValueError(
+                            f"GDN input width {input_width} "
+                            f"is not divisible by n_v={n_v}"
+                        )
+
+                    permutation = HadamardPermutation(
+                        hd=input_width // n_v,
+                        nk=n_k,
+                        rep=n_v // n_k,
+                    )
+
+                    skip_input_layout = True
+
+                hadamard_forward_modules[module_name] = HadamardRuntimeConfig(
+                                                             config=hcfg,
+                                                             permutation=permutation,
+                                                             skip_input_layout=skip_input_layout,
+                                                        )
+
+            # -----------------------------------------------------
+            # Inverse-after-lookup weights
+            # -----------------------------------------------------
+
+            for gguf_name in hcfg.inverse_weight_names:
+                module_name = self._weight_name_to_module_name(
+                    gguf_name,
+                    name_map
+                )
+
+                if module_name in hadamard_inverse_modules:
+                    raise ValueError(
+                        "duplicate Prism Hadamard inverse module: "
+                        f"{module_name}"
+                    )
+
+                hadamard_inverse_modules.add(module_name)
+
+        # ---------------------------------------------------------
+        # Existing GGUF plugin setup
+        # ---------------------------------------------------------
+
+        unquantized_modules = (
+            _get_unquantized_modules(
+                files,
+                name_map,
+            )
+            + tuple(adapter.extra_unquantized_modules)
         )
-        linear_layouts = adapter.get_linear_layouts(files, model_config, name_map)
+
+        linear_layouts = adapter.get_linear_layouts(
+            files,
+            model_config,
+            name_map,
+        )
+
         return adapter, GGUFLoadPlan(
-            files, name_map, unquantized_modules, linear_layouts
+            files=files,
+            name_map=name_map,
+            unquantized_modules=unquantized_modules,
+            linear_layouts=linear_layouts,
+            hadamard_config=hcfg,
+            hadamard_forward_modules=hadamard_forward_modules,
+            hadamard_inverse_modules=hadamard_inverse_modules,
         )
+
 
     def _iter_weights(
         self,
@@ -212,6 +392,19 @@ class GGUFModelLoader(BaseModelLoader):
             plan.linear_layouts,
             prefix=prefix,
         )
+        quant_config = vllm_config.quant_config
+
+        if ( plan.hadamard_config is not None
+             and isinstance(quant_config, GGUFConfig) ):
+
+
+            quant_config.register_hadamard(
+                plan.hadamard_config,
+                plan.hadamard_forward_modules,
+                plan.hadamard_inverse_modules,
+                prefix=prefix,
+            )
+
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):

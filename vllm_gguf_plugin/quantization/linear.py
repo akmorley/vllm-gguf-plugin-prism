@@ -30,6 +30,25 @@ from .utils import (
     MMVQ_QUANT_TYPES,
     UNQUANTIZED_TYPES,
 )
+from ..hadamard import (
+    HadamardRuntimeConfig,
+    apply_forward_hadamard,
+)
+
+def debug_plain_rmsnorm(
+    x: torch.Tensor,
+    eps: float,
+):
+    xf = x.float()
+
+    y = xf * torch.rsqrt(
+        xf.pow(2).mean(
+            dim=-1,
+            keepdim=True,
+        ) + eps
+    )
+
+
 
 
 def _fused_mul_mat_gguf(
@@ -80,14 +99,15 @@ except AttributeError as error:
 @register_weight_loader_v2_supported_method
 class GGUFLinearMethod(LinearMethodBase):
     """Linear method for GGUF."""
-
     def __init__(
         self,
         quant_config,
         layout: GGUFLinearLayout | None = None,
+        hadamard_runtime_config: HadamardRuntimeConfig | None = None,
     ) -> None:
         self.quant_config = quant_config
         self.layout = layout
+        self.hadamard_runtime_config = hadamard_runtime_config
 
     def create_weights(
         self,
@@ -226,39 +246,83 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
-        if self.layout is not None:
+        hadamard_runtime = self.hadamard_runtime_config
+        skip_input_layout = (
+            hadamard_runtime is not None and hadamard_runtime.skip_input_layout
+        )
+
+        # The loader already places grouped GDN activations in Prism order.
+        # Applying the stored permutation again would double-permute the input.
+        if hadamard_runtime is not None:
+            x = apply_forward_hadamard(x, hadamard_runtime.config)
+
+        if self.layout is not None and not skip_input_layout:
             x = self.layout.input_to_gguf(x)
 
         shard_id = layer.weight.shard_id
+
+        # ---------------------------------------------------------
+        # Packed / merged weight
+        # ---------------------------------------------------------
         if shard_id:
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            if "q" in shard_id:
+                shard_id = ["q", "k", "v"]
+
             weight = layer.weight
             fallback_wtype = layer.weight_type.weight_type
+
             shard_weight_types = [
-                layer.weight_type.shard_weight_type.get(idx, fallback_wtype)
+                layer.weight_type.shard_weight_type.get(
+                    idx,
+                    fallback_wtype,
+                )
                 for idx in shard_id
             ]
+
+            # All packed shards have the same GGUF type, so the whole
+            # packed tensor can be handled by one kernel invocation.
             if len(set(shard_weight_types)) == 1:
-                out = fused_mul_mat_gguf_op(x, weight, shard_weight_types[0])
-                if bias is not None:
-                    out.add_(bias)
-                return out
-            result = []
-            for idx in shard_id:
-                start, end, offset = layer.weight.shard_offset_map[idx]
-                weight_type = layer.weight_type.shard_weight_type.get(
-                    idx, fallback_wtype
+                out = fused_mul_mat_gguf_op(
+                    x,
+                    weight,
+                    shard_weight_types[0],
                 )
-                result.append(
-                    fused_mul_mat_gguf_op(
-                        x, weight[start:end, :offset].contiguous(), weight_type
+
+            else:
+                # Mixed GGUF types: execute each logical shard using
+                # its own type and concatenate the results.
+                result = []
+
+                for idx in shard_id:
+                    start, end, offset = layer.weight.shard_offset_map[idx]
+
+                    weight_type = (
+                        layer.weight_type.shard_weight_type.get(
+                            idx,
+                            fallback_wtype,
+                        )
                     )
-                )
-            out = torch.cat(result, axis=1)
+
+                    shard_out = fused_mul_mat_gguf_op(
+                        x,
+                        weight[start:end, :offset].contiguous(),
+                        weight_type,
+                    )
+
+                    result.append(shard_out)
+
+                out = torch.cat(result,dim=1)
+
+        # ---------------------------------------------------------
+        # Ordinary unmerged weight
+        # ---------------------------------------------------------
         else:
             weight = layer.weight
             weight_type = layer.weight_type.weight_type
-            out = fused_mul_mat_gguf_op(x, weight, weight_type)
+
+            out = fused_mul_mat_gguf_op(x,weight,weight_type)
+
         if bias is not None:
             out.add_(bias)
+
         return out

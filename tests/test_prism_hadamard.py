@@ -362,7 +362,6 @@ def test_forward_helper_matches_prism_semantics_without_permutation():
     actual = apply_forward_hadamard(
         x,
         cfg,
-        permutation=None,
     )
 
     torch.testing.assert_close(
@@ -456,7 +455,6 @@ def test_forward_then_inverse_roundtrip_without_permutation():
     y = apply_forward_hadamard(
         x,
         cfg,
-        permutation=None,
     )
 
     z = apply_inverse_hadamard(
@@ -1218,7 +1216,8 @@ def test_forward_then_inverse_roundtrip():
 
 def test_forward_gdn_order_is_permute_sign_fwht():
     """
-    This test pins the Prism forward transform order:
+    This test pins the Prism forward transform order with the GDN layout
+    supplied before the runtime helper:
 
         GDN permutation
         -> signs
@@ -1259,9 +1258,8 @@ def test_forward_gdn_order_is_permute_sign_fwht():
     )
 
     got = apply_forward_hadamard(
-        x,
+        permute_gdn_v(x, permutation),
         cfg,
-        permutation=permutation,
     )
 
     permuted = (
@@ -1334,9 +1332,8 @@ def test_forward_gdn_result_changes_if_order_is_wrong():
     )
 
     correct = apply_forward_hadamard(
-        x,
+        permute_gdn_v(x, permutation),
         cfg,
-        permutation=permutation,
     )
 
     wrong = permute_gdn_v(

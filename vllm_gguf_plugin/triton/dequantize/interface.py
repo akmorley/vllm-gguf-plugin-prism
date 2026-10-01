@@ -21,6 +21,7 @@ from ..gemm.utils import (
     GGML_TYPE_Q6_K,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q8_1,
+    GGML_TYPE_PQ2_0,
 )
 from .iq_quant import (
     ggml_dequantize_iq1_m_triton,
