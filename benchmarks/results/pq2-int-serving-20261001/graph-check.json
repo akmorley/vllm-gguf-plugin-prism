@@ -1,0 +1,25 @@
+{
+  "counts": {
+    "quantizer": {
+      "calls": 7719,
+      "graph_calls": 7680
+    },
+    "integer": {
+      "calls": 7719,
+      "graph_calls": 7680
+    }
+  },
+  "grids": {
+    "quantizer": [
+      320,
+      1088
+    ],
+    "integer": [
+      320,
+      896,
+      1024,
+      2176,
+      15520
+    ]
+  }
+}

@@ -9,6 +9,7 @@ import triton.language as tl
 
 # Read once before graph capture; opt-in while model/serving acceptance is pending.
 _EXPERIMENTAL_BATCHED_GEMV = os.environ.get("GGUF_PQ2_BATCHED_GEMV", "0") == "1"
+_EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
 _BATCHED_GEMV_SHAPES = frozenset(
     {(34816, 5120), (5120, 17408), (16384, 5120), (14336, 5120), (248320, 5120)}
 )
@@ -18,6 +19,18 @@ def _use_batched_gemv(x, n, k):
     return (
         _EXPERIMENTAL_BATCHED_GEMV
         and x.shape[0] == 4
+        and (n, k) in _BATCHED_GEMV_SHAPES
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    )
+
+
+def _use_int_gemv(x, n, k):
+    # Only measured batches/shapes: M=16 gains are too close to noise to select.
+    return (
+        _EXPERIMENTAL_INT_GEMV
+        and x.shape[0] in (1, 2, 4, 5, 8)
         and (n, k) in _BATCHED_GEMV_SHAPES
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.is_cuda
@@ -125,6 +138,10 @@ def pq2_matmul(x, weight):
     x = x.contiguous()
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if _use_int_gemv(x, n, k):
+        from .pq2_int_gemv import pq2_int_gemv
+
+        return pq2_int_gemv(x, weight)
     if _use_batched_gemv(x, n, k):
         from .pq2_gemv import pq2_batched_gemv
 

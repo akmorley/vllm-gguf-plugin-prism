@@ -107,3 +107,7 @@ plugin and vLLM versions, and the complete weight-mapping error.
 Use [the serving benchmark guide](benchmarks/SERVING.md) to measure the local
 27B model across prompt lengths and request concurrency. The harness saves
 throughput, latency percentiles, GPU memory samples, and raw vLLM results.
+
+The [experimental PQ2 integer decode guide](benchmarks/PQ2_INTEGER_DECODE.md)
+documents the default-off `GGUF_PQ2_INT_GEMV=1` experiment, measured dispatch
+rules, kernel results, and numerical acceptance work.

@@ -159,3 +159,61 @@ def test_integer_gemv_rejects_unsupported_batches(m):
     w = torch.empty(9, 34, dtype=torch.uint8, device="cuda")
     with pytest.raises(ValueError, match="1 to 16"):
         pq2_int_gemv(x, w)
+
+
+def test_integer_serving_dispatch_preserves_fallbacks(monkeypatch):
+    from vllm_gguf_plugin.triton import prism
+
+    monkeypatch.setattr(prism, "_EXPERIMENTAL_INT_GEMV", True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 6))
+    x = torch.empty(1, 5120, dtype=torch.bfloat16, device="cuda")
+    for m in (1, 2, 4, 5, 8):
+        for n, k in prism._BATCHED_GEMV_SHAPES:
+            assert prism._use_int_gemv(x.expand(m, -1), n, k)
+    for m in (0, 3, 6, 7, 9, 16, 32):
+        assert not prism._use_int_gemv(x.expand(m, -1), 34816, 5120)
+    assert not prism._use_int_gemv(x, 37, 5120)
+    assert not prism._use_int_gemv(x.float(), 34816, 5120)
+    assert not prism._use_int_gemv(x.cpu(), 34816, 5120)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    assert not prism._use_int_gemv(x, 34816, 5120)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 6))
+    monkeypatch.setattr(prism, "_EXPERIMENTAL_INT_GEMV", False)
+    assert not prism._use_int_gemv(x, 34816, 5120)
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 5, 8])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_integer_serving_dispatch_graph_replay(monkeypatch, m, dtype):
+    from vllm_gguf_plugin.triton import prism
+    from vllm_gguf_plugin.triton.pq2_int_gemv import pq2_int_gemv
+
+    if torch.cuda.get_device_capability() != (8, 6):
+        pytest.skip("Serving experiment is limited to SM86")
+    monkeypatch.setattr(prism, "_EXPERIMENTAL_INT_GEMV", True)
+    monkeypatch.setattr(prism, "_EXPERIMENTAL_BATCHED_GEMV", True)
+    n, k = 5120, 17408
+    blocks = torch.zeros(n, k // 128, 34, dtype=torch.uint8, device="cuda")
+    scales = torch.full((n, k // 128), 0.01, dtype=torch.float16, device="cuda")
+    blocks[:, :, :2] = scales.view(torch.uint8).reshape(n, k // 128, 2)
+    blocks[:, :, 2:] = 0xE4
+    weight = blocks.reshape(n, -1)
+    x = torch.randn(m, k, dtype=dtype, device="cuda")
+    calls = []
+
+    def observed(x, weight):
+        calls.append(x.shape[0])
+        return pq2_int_gemv(x, weight)
+
+    from vllm_gguf_plugin.triton import pq2_int_gemv as module
+
+    monkeypatch.setattr(module, "pq2_int_gemv", observed)
+    for _ in range(3):
+        prism.pq2_matmul(x, weight)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = prism.pq2_matmul(x, weight)
+    x.mul_(0.5)
+    graph.replay()
+    torch.testing.assert_close(captured, pq2_int_gemv(x, weight), rtol=0, atol=0)
+    assert calls == [m] * 4  # Integer precedence even when both flags are enabled.

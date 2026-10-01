@@ -1,0 +1,25 @@
+{
+  "token_mismatches": [
+    {
+      "batch": 0,
+      "choice": 0,
+      "first_divergence": 60
+    },
+    {
+      "batch": 0,
+      "choice": 2,
+      "first_divergence": 15
+    },
+    {
+      "batch": 1,
+      "choice": 3,
+      "first_divergence": 24
+    }
+  ],
+  "aligned_generated_tokens": 419,
+  "max_generated_logprob_delta": 0.10375916957855225,
+  "mean_generated_logprob_delta": 0.006024095594276242,
+  "common_top_logprobs": 2091,
+  "max_common_top_logprob_delta": 0.6249961853027344,
+  "note": "Diagnostic fixed workload; no Q8 quality acceptance threshold inferred."
+}
