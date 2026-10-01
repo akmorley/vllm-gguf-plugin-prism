@@ -332,6 +332,9 @@ class GGUFModelLoader(BaseModelLoader):
 
                 hadamard_inverse_modules.add(module_name)
 
+        if hcfg is not None and hcfg.tied_output:
+            hadamard_forward_modules["lm_head"] = HadamardRuntimeConfig(config=hcfg)
+
         # ---------------------------------------------------------
         # Existing GGUF plugin setup
         # ---------------------------------------------------------
@@ -385,6 +388,11 @@ class GGUFModelLoader(BaseModelLoader):
     ) -> nn.Module:
         device_config = vllm_config.device_config
         adapter, plan = self._prepare_adapter(model_config)
+        if (
+            plan.hadamard_config is not None
+            and vllm_config.parallel_config.tensor_parallel_size != 1
+        ):
+            raise ValueError("Prism Hadamard currently requires tensor_parallel_size=1")
         logger.debug("GGUF unquantized modules: %s", plan.unquantized_modules)
         vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(plan.unquantized_modules)
@@ -407,6 +415,11 @@ class GGUFModelLoader(BaseModelLoader):
 
 
         target_device = torch.device(device_config.device)
+        if plan.hadamard_config is not None:
+            for width in plan.hadamard_config.signs_by_width:
+                plan.hadamard_config.signs_for(
+                    width, device=target_device, dtype=model_config.dtype
+                )
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = initialize_model(

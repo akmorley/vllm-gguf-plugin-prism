@@ -232,5 +232,6 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         return out
 
     def tie_weights(self, layer: torch.nn.Module, embed_tokens: VocabParallelEmbedding):
-        del layer
-        return embed_tokens
+        layer.weight = embed_tokens.weight
+        layer.weight_type = embed_tokens.weight_type
+        return layer

@@ -72,6 +72,9 @@ class DummyHadamardConfig:
         self.block_size = block_size
         self.signs_by_width = signs_by_width
         self.sign_mode = sign_mode
+        self._device_signs = {}
+
+    signs_for = PrismHadamardConfig.signs_for
 
 
 def test_prism_matrix_n4_exact():
@@ -802,7 +805,7 @@ def test_fwht_known_result():
         (3, 16),
     ],
 )
-def test_fwht_is_self_inverse(shape):
+def test_fwht_is_self_inverse_parametrized(shape):
     torch.manual_seed(1234)
 
     x = torch.randn(

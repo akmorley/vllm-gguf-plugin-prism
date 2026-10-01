@@ -50,9 +50,8 @@ class PrismHadamardConfig:
     """
     Parsed `prism.hadamard.*` GGUF metadata.
 
-    Keep sign vectors as CPU integer tensors here. Move/cast them only when
-    applying a transform, because this config is normally created before the
-    final execution device/dtype is known.
+    Keep metadata sign vectors on CPU and cache execution copies by device
+    and dtype. The loader preloads them before CUDA graph capture.
     """
 
     version: int
@@ -69,6 +68,7 @@ class PrismHadamardConfig:
 
     gdn_v_grouped: bool = False
     tied_output: bool = False
+    _device_signs: dict = field(default_factory=dict, repr=False)
 
     def has_forward_transform(self, weight_name: str) -> bool:
         return weight_name in self.weight_names
@@ -88,22 +88,20 @@ class PrismHadamardConfig:
 
         Identity sign mode returns None.
         """
-        if self.sign_mode != "explicit":
+        signs = _get_signs_for_width(self, width)
+        if signs is None:
             return None
-
-        try:
-            signs = self.signs_by_width[width]
-        except KeyError as exc:
-            raise ValueError(
-                "Prism Hadamard metadata has no sign vector "
-                f"for activation width {width}"
-            ) from exc
-
-        return signs.to(
-            device=device,
-            dtype=dtype,
-            non_blocking=True,
-        )
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        key = (width, device, dtype)
+        if key not in self._device_signs:
+            if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Prism signs must be preloaded before CUDA graph capture"
+                )
+            self._device_signs[key] = signs.to(device=device, dtype=dtype)
+        return self._device_signs[key]
 
 @dataclass
 class HadamardRuntimeConfig:
@@ -539,16 +537,12 @@ def fwht_blockwise(
 
     Transform is normalized by 1 / sqrt(block_size).
     """
+    if block_size <= 0 or block_size & (block_size - 1):
+        raise ValueError(f"Hadamard block size must be a power of two, got {block_size}")
     if x.shape[-1] % block_size != 0:
         raise ValueError(
             f"width {x.shape[-1]} is not divisible "
             f"by Hadamard block size {block_size}"
-        )
-
-    if block_size <= 0 or block_size & (block_size - 1):
-        raise ValueError(
-            f"Hadamard block size must be a power of two, "
-            f"got {block_size}"
         )
 
     original_shape = x.shape
@@ -612,46 +606,19 @@ def apply_forward_hadamard(
     # post-permutation activation order.
 
         
-    signs = _get_signs_for_width(config,x.shape[-1])
-
+    signs = config.signs_for(x.shape[-1], device=x.device, dtype=x.dtype)
+    if x.is_cuda:
+        from .triton.prism import hadamard
+        return hadamard(x, signs, config.block_size, inverse=False)
     if signs is not None:
-        signs = signs.to(
-            device=x.device,
-            dtype=x.dtype,
-        )
-
         x = x * signs
-
-    x =  fwht_blockwise(x,config.block_size)
-
-    return x
+    return fwht_blockwise(x, config.block_size)
 
 
-def apply_inverse_hadamard(
-    x: torch.Tensor,
-    config: PrismHadamardConfig,
-) -> torch.Tensor:
-    # Prism inverse semantics:
-    #     H -> signs
-    #
-    # H is self-inverse because it is the normalized Sylvester
-    # Hadamard transform.
-
-    x = fwht_blockwise(
-        x,
-        config.block_size,
-    )
-
-    signs = _get_signs_for_width(
-        config,
-        x.shape[-1],
-    )
-
-    if signs is not None:
-        signs = signs.to(
-            device=x.device,
-            dtype=x.dtype,
-        )
-        x = x * signs
-
-    return x
+def apply_inverse_hadamard(x: torch.Tensor, config: PrismHadamardConfig) -> torch.Tensor:
+    signs = config.signs_for(x.shape[-1], device=x.device, dtype=x.dtype)
+    if x.is_cuda:
+        from .triton.prism import hadamard
+        return hadamard(x, signs, config.block_size, inverse=True)
+    x = fwht_blockwise(x, config.block_size)
+    return x if signs is None else x * signs

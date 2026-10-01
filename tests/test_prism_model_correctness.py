@@ -216,9 +216,9 @@ def test_prism_model_end_to_end_correctness():
 
     result = outputs[0].outputs[0]
 
-    print("token:", out.token_ids[0])
+    print("token:", result.token_ids[0])
     
-    for token_id, lp in out.logprobs[0].items():
+    for token_id, lp in result.logprobs[0].items():
         print(
             token_id,
             lp.logprob,

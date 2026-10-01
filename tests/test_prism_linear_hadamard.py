@@ -63,7 +63,8 @@ def test_packed_runtime_agreement(suffix, sources):
     with pytest.raises(ValueError, match="runtime configuration mismatch"):
         config._resolve_packed_hadamard(base + suffix)
     del config.hadamard_forward_modules[base + sources[-1]]
-    assert config._resolve_packed_hadamard(base + suffix) is None
+    with pytest.raises(ValueError, match="Partial packed"):
+        config._resolve_packed_hadamard(base + suffix)
 
 
 def test_embedding_installs_forward_runtime_and_inverse_metadata():
@@ -122,3 +123,14 @@ def test_quant_method_receives_runtime(kind):
     assert method.hadamard_runtime_config is runtime
     if kind == "embedding":
         assert method.inverse_hadamard_config is hcfg
+
+
+def test_tied_head_keeps_forward_method_and_shares_parameters():
+    config = make_hadamard_config()
+    runtime = HadamardRuntimeConfig(config)
+    head = SimpleNamespace(quant_method=GGUFEmbeddingMethod(None, hadamard_runtime_config=runtime))
+    embedding = SimpleNamespace(weight=torch.nn.Parameter(torch.randn(8, 4)), weight_type=SimpleNamespace(weight_type=0))
+    assert head.quant_method.tie_weights(head, embedding) is head
+    assert head.weight is embedding.weight
+    assert head.weight_type is embedding.weight_type
+    assert head.quant_method.hadamard_runtime_config is runtime

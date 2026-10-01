@@ -60,6 +60,9 @@ def _fused_mul_mat_gguf(
         mmvq_safe = 2 if weight.shape[0] > 5120 else 6
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+    if weight_type == WeightType.PQ2_0 and x.is_cuda:
+        from ..triton.prism import pq2_matmul
+        return pq2_matmul(x, weight)
     if weight_type in UNQUANTIZED_TYPES:
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:

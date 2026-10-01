@@ -131,7 +131,12 @@ class GGUFConfig(QuantizationConfig):
             return None
 
         # All constituent projections must be Prism-folded.
-        if not all(source in self.hadamard_forward_modules for source in sources):
+        present = [source in self.hadamard_forward_modules for source in sources]
+        if any(present) and not all(present):
+            raise ValueError(
+                f"Partial packed Prism Hadamard coverage for {prefix}: {sources}"
+            )
+        if not any(present):
             return None
 
         runtime_configs = [self.hadamard_forward_modules[source] for source in sources]
