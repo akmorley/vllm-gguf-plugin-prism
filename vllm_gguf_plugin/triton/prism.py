@@ -53,12 +53,12 @@ def hadamard(x, signs, block_size, inverse=False):
     return y
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _pq2(
     X,
     W,
     Y,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     STRIDE: tl.constexpr,

@@ -69,3 +69,30 @@ def test_fused_hadamard_and_graph(dtype):
         captured = apply_forward_hadamard(x, cfg)
     graph.replay()
     torch.testing.assert_close(captured, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_pq2_mixed_token_counts_reuse_kernel_and_capture(dtype):
+    """Mixed prefills reuse compiled GEMM while masking tail rows in graphs."""
+    from vllm_gguf_plugin.triton.prism import _pq2
+
+    n, k = 37, 384
+    packed = torch.zeros(n * 2, k // 128 * 34, device="cuda", dtype=torch.uint8)
+    weight = packed[::2]
+    blocks = weight.view(n, k // 128, 34)
+    scales = torch.ones(n, k // 128, device="cuda", dtype=torch.float16)
+    blocks[:, :, :2] = scales.view(torch.uint8).reshape(n, k // 128, 2)
+    blocks[:, :, 2:] = 0xAA  # Every code is 2, so every weight is +1.
+    cache_sizes = []
+    for m in (5, 8, 13, 16, 65, 128, 256, 258):
+        x = torch.randn(m, k, device="cuda", dtype=dtype)
+        expected = x.float().sum(dim=1, keepdim=True).expand(m, n).to(dtype)
+        for _ in range(3):
+            pq2_matmul(x, weight)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = pq2_matmul(x, weight)
+        graph.replay()
+        torch.testing.assert_close(result, expected, atol=0.02, rtol=0.005)
+        cache_sizes.append(sum(len(cache[0]) for cache in _pq2.device_caches.values()))
+    assert len(set(cache_sizes)) == 1, "M must not cause new compiled variants"
