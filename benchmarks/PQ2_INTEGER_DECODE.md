@@ -67,3 +67,12 @@ CUDA_VISIBLE_DEVICES=1 GGUF_PQ2_INT_GEMV=0 GGUF_PQ2_BATCHED_GEMV=0 \
 The containing workspace's `benchmarks/results/pq2-int-gemv-20261001` and
 `pq2-int-numerics-20261001` retain full reports, raw data, source fingerprints,
 and replayable captures. Those workspace artifacts are outside this Git repository.
+
+## Packed loading and scheduling investigation
+
+The [packed-layout report](results/pq2-packed-20261001/report.md) compares
+raw byte/half loads, aligned code/scale buffers, simpler signed-byte expansion,
+software pipelining, cache policy, and warp-lane mappings. The benchmark-only
+`pq2_packed_experiment.py` module has no serving dispatch. Preserve the original
+weights for existing prefill/fallbacks until those paths support a shared prepared
+layout; do not add per-call preparation or silently duplicate resident weights.
