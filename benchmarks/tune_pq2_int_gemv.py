@@ -46,7 +46,20 @@ def launch(q, s, w, y, m, n, k, bn, bc, warps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--extended", action="store_true")
+    parser.add_argument("--tokens", nargs="+", type=int, default=[1, 4])
     args = parser.parse_args()
+    if any(m < 1 or m > 16 for m in args.tokens):
+        parser.error("tokens must be between 1 and 16")
+    tiles = TILES
+    if args.extended:
+        tiles = [(16, 4, 4)] + [
+            (bn, bc, warps)
+            for bn in (8, 16, 32, 64)
+            for bc in (4, 8, 16)
+            for warps in (4, 8)
+            if (bn, bc, warps) != (16, 4, 4)
+        ]
     torch.manual_seed(7)
     records = []
     for name in ("ffn_gate_up", "ffn_down"):
@@ -55,7 +68,7 @@ def main():
         scales = torch.rand(n, k // 128, dtype=torch.float16, device="cuda") * 0.02
         w[:, :, :2] = scales.view(torch.uint8).reshape(n, k // 128, 2)
         w = w.reshape(n, -1)
-        for m in (1, 4):
+        for m in args.tokens:
             x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
             q = torch.empty_like(x, dtype=torch.int8)
             s = torch.empty(m, k // 128, dtype=torch.float32, device="cuda")
@@ -63,7 +76,7 @@ def main():
             _quantize[(m * (k // 128),)](x, q, s, k)
             q = q.view(torch.int32)
             reference = None
-            for bn, bc, warps in TILES:
+            for bn, bc, warps in tiles:
                 run = partial(launch, q, s, w, y, m, n, k, bn, bc, warps)
                 kernel = run()
                 if reference is None:
