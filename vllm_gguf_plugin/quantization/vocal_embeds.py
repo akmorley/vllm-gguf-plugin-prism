@@ -17,9 +17,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
 from ..hadamard import HadamardRuntimeConfig, PrismHadamardConfig, apply_inverse_hadamard
-from .linear import (
-    GGUFLinearMethod,
-)
+from .linear import GGUFLinearMethod
 from .params import (
     GGUFUninitializedWeightParameter,
     GGUFUninitializedWeightTypeParameter,
