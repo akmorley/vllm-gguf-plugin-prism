@@ -101,3 +101,9 @@ to the corresponding Hugging Face model. A model appearing in vLLM's general
 supported-model list does not by itself guarantee GGUF compatibility. When
 reporting an unsupported model, include the model repository, quantization,
 plugin and vLLM versions, and the complete weight-mapping error.
+
+## Prism serving benchmark
+
+Use [the serving benchmark guide](benchmarks/SERVING.md) to measure the local
+27B model across prompt lengths and request concurrency. The harness saves
+throughput, latency percentiles, GPU memory samples, and raw vLLM results.
