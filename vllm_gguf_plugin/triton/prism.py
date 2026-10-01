@@ -1,9 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prism kernels: packed PQ2 multiplication and normalized block FWHT."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+# Read once before graph capture; opt-in while model/serving acceptance is pending.
+_EXPERIMENTAL_BATCHED_GEMV = os.environ.get("GGUF_PQ2_BATCHED_GEMV", "0") == "1"
+_BATCHED_GEMV_SHAPES = frozenset(
+    {(34816, 5120), (5120, 17408), (16384, 5120), (14336, 5120), (248320, 5120)}
+)
+
+
+def _use_batched_gemv(x, n, k):
+    return (
+        _EXPERIMENTAL_BATCHED_GEMV
+        and x.shape[0] == 4
+        and (n, k) in _BATCHED_GEMV_SHAPES
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    )
 
 
 @triton.jit
@@ -106,6 +125,10 @@ def pq2_matmul(x, weight):
     x = x.contiguous()
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if _use_batched_gemv(x, n, k):
+        from .pq2_gemv import pq2_batched_gemv
+
+        return pq2_batched_gemv(x, weight)
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
     if m and n and m <= 4 and k <= 32768:
         _pq2_gemv[(n, m)](

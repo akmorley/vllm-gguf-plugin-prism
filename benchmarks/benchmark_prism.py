@@ -4,6 +4,7 @@
 import argparse
 import csv
 import json
+import math
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from gguf import GGMLQuantizationType
 from triton.testing import do_bench_cudagraph
 
 from vllm_gguf_plugin import ops
+from vllm_gguf_plugin.triton.pq2_gemv import _batched_gemv, pq2_batched_gemv
 from vllm_gguf_plugin.triton.pq2_mmq import _mmq, _quantize, pq2_mmq
 from vllm_gguf_plugin.triton.prism import _pq2, _pq2_gemv, pq2_matmul
 
@@ -29,7 +31,7 @@ TOKENS = (1, 2, 4, 5, 8, 16, 32, 128, 512, 1024)
 def kernel_resources():
     """Record compiled resources when exposed by this Triton version."""
     result = []
-    for function in (_pq2, _pq2_gemv, _mmq, _quantize):
+    for function in (_pq2, _pq2_gemv, _mmq, _quantize, _batched_gemv):
         for cache in function.device_caches.values():
             for kernel in cache[0].values():
                 result.append(
@@ -101,10 +103,24 @@ def benchmark(m, n, k, dtype, layout, methods, rep):
             .sqrt()
             .item()
         )
-        if mmq_relative_rms > 0.03:
+        if not math.isfinite(mmq_relative_rms) or mmq_relative_rms > 0.03:
             raise AssertionError(f"MMQ relative RMS {mmq_relative_rms} exceeds 0.03")
+    gemv_first_call_ms = None
+    if "batched_gemv" in methods:
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        candidate = pq2_batched_gemv(x, w)
+        torch.cuda.synchronize()
+        gemv_first_call_ms = (time.perf_counter() - start) * 1000
+        torch.testing.assert_close(
+            candidate,
+            expected,
+            atol=0.02 if dtype == torch.bfloat16 else 0.005,
+            rtol=0.02 if dtype == torch.bfloat16 else 0.005,
+        )
     del expected, actual
     functions = {
+        "batched_gemv": lambda: pq2_batched_gemv(x, w),
         "native": lambda: pq2_matmul(x, w),
         "mmq": lambda: pq2_mmq(x, w),
         "dequant_dense": lambda: x @ dequantize().T,
@@ -139,13 +155,15 @@ def benchmark(m, n, k, dtype, layout, methods, rep):
                 "latency_ms": latency_ms,
                 "relative_rms_vs_float": mmq_relative_rms if method == "mmq" else None,
                 "packed_weight_GB_s": n * stride / (latency_ms * 1e6)
-                if method in ("native", "mmq")
+                if method in ("native", "mmq", "batched_gemv")
                 else None,
                 "temporary_bytes_including_output": temporary_bytes,
                 "first_call_ms": native_first_call_ms
                 if method == "native"
                 else mmq_first_call_ms
                 if method == "mmq"
+                else gemv_first_call_ms
+                if method == "batched_gemv"
                 else first_call_ms,
             }
         )
@@ -176,7 +194,7 @@ def main():
     parser.add_argument(
         "--methods",
         nargs="+",
-        choices=("native", "mmq", "dequant_dense", "dense"),
+        choices=("native", "mmq", "batched_gemv", "dequant_dense", "dense"),
         default=["native", "dequant_dense", "dense"],
     )
     parser.add_argument("--rep-ms", type=int, default=100)
@@ -184,6 +202,8 @@ def main():
     args = parser.parse_args()
     if min(args.tokens) <= 0 or args.rep_ms <= 0:
         parser.error("tokens and rep-ms must be positive")
+    if "batched_gemv" in args.methods and max(args.tokens) > 16:
+        parser.error("batched_gemv requires token counts <= 16")
     torch.manual_seed(7)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     metadata = {
