@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
+
 
 @triton.jit(do_not_specialize=["M"])
 def _batched_gemv(
@@ -18,6 +20,7 @@ def _batched_gemv(
     BT: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    PREPARED: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * BN + tl.arange(0, BN)
     tokens = tl.arange(0, BT)
@@ -25,14 +28,20 @@ def _batched_gemv(
     acc = tl.full((BT, BN, BK), 0, tl.float32)
     for base in range(tl.cdiv(K, BK)):
         k = base * BK + offsets
-        address = rows[:, None] * STRIDE + (k[None, :] // 128) * 34
         mask = (rows[:, None] < N) & (k[None, :] < K)
-        lo = tl.load(W + address, mask, other=0).to(tl.uint16)
-        hi = tl.load(W + address + 1, mask, other=0).to(tl.uint16)
-        scale = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        packed = tl.load(W + address + 2 + (k[None, :] % 128) // 4, mask, other=0).to(
-            tl.int32
+        scale = _pq2_scale(
+            W, rows[:, None], k[None, :] // 128, N, K, STRIDE, mask, PREPARED
         )
+        packed = _pq2_codes(
+            W,
+            rows[:, None],
+            k[None, :] // 128,
+            (k[None, :] % 128) // 4,
+            K,
+            STRIDE,
+            mask,
+            PREPARED,
+        ).to(tl.int32)
         code = ((packed >> (2 * (k[None, :] % 4))) & 3) - 1
         a = tl.load(
             X + tokens[:, None] * K + k[None, :],
@@ -49,7 +58,7 @@ def _batched_gemv(
     )
 
 
-def pq2_batched_gemv(x, weight):
+def pq2_batched_gemv(x, weight, *, prepared=False):
     """Reuse unpacked row tiles across up to sixteen tokens; no Q8 rounding."""
     m, k = x.shape
     n = weight.shape[0]
@@ -58,6 +67,8 @@ def pq2_batched_gemv(x, weight):
     if k % 128 or weight.shape[1] != k // 128 * 34:
         raise ValueError("Invalid PQ2 packed matrix shape")
     x = x.contiguous()
+    if prepared:
+        validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
@@ -73,6 +84,7 @@ def pq2_batched_gemv(x, weight):
             triton.next_power_of_2(m),
             4,
             256,
+            prepared,
             num_warps=4,
         )
     return y

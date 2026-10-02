@@ -76,3 +76,20 @@ software pipelining, cache policy, and warp-lane mappings. The benchmark-only
 `pq2_packed_experiment.py` module has no serving dispatch. Preserve the original
 weights for existing prefill/fallbacks until those paths support a shared prepared
 layout; do not add per-call preparation or silently duplicate resident weights.
+
+## Integrated unpack arithmetic
+
+The signed-byte spread/add/XOR expansion is now integrated into `_int_gemv`.
+It preserves the existing fixed tile, Q8 groups, reduction order, and storage.
+The [slice report](results/pq2-unpack-20261001/report.md) records 213 tests,
+100 bitwise full-shape comparisons, real-model replay, and matched timing evidence.
+The unpack-only slice uses raw storage; the subsequent opt-in shared layout is described below.
+The [whitepaper review](BONSAI2_WHITEPAPER_REVIEW.md) and the slice's offline
+32/128-element activation-group diagnostic explain why Q8 quality validation
+remains necessary before default adoption.
+
+## Shared prepared layout
+
+Set `GGUF_PQ2_PREPARED=1` before starting a fresh SM86 server to prepare pure-PQ2 weights once during loading. Pair with `GGUF_PQ2_INT_GEMV=1` to reproduce the measured decode gains; both flags remain off by default. All prepared readers share one allocation containing packed codes followed by FP16 scales, preserving 34 bytes per 128 weights. Embeddings and floating prefill/fallbacks support the same layout. Ties preserve Parameter identity; mixed-type and unsupported-device tensors retain raw storage. Preparation finishes before graph capture and releases original shard references. Prepared APIs require the entire owned contiguous allocation.
+
+vLLM compilation factors include the normalized layout mode and `planes-v1` format version, preventing raw/prepared graph-cache reuse. The [shared-layout report](results/pq2-prepared-20261002/report.md) records 405 consolidated passing tests, 97 final strict layout tests, 96 byte-identical matrix cases, and 108 byte-identical saved outputs. Matched short-prompt serving improves throughput 10.0%/6.6%/5.2% at concurrency 1/4/8, with TTFT rising 5.9%/5.0%/2.8%. Some prefill shapes regress by 3–10%; default promotion is premature. All eight greedy continuations match, but serving logprobs drift across repeats. Packed parameter bytes are identical across modes, with no second resident weight copy.

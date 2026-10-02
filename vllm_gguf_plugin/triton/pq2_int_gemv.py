@@ -2,13 +2,14 @@
 """Experimental PQ2 x Q8 decode with packed signed INT8 DP4A operations.
 
 Independent implementation; activation quantization matches our MMQ prototype,
-not a claim of llama.cpp Q8_1 equivalence. Serving dispatch is unchanged.
+not a claim of llama.cpp Q8_1 equivalence. Serving use remains opt-in.
 """
 
 import torch
 import triton
 import triton.language as tl
 
+from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 from .pq2_mmq import _quantize
 
 
@@ -25,6 +26,7 @@ def _int_gemv(
     BT: tl.constexpr,
     BN: tl.constexpr,
     BC: tl.constexpr,
+    PREPARED: tl.constexpr = False,
 ):
     tokens = tl.arange(0, BT)
     rows = tl.program_id(0) * BN + tl.arange(0, BN)
@@ -43,21 +45,24 @@ def _int_gemv(
             (tokens[:, None, None] < M) & valid[None, :, None],
             other=0,
         )
-        address = rows[:, None] * STRIDE + block[None, :] * 34
         mask = (rows[:, None] < N) & valid[None, :]
-        lo = tl.load(W + address, mask, other=0).to(tl.uint16)
-        hi = tl.load(W + address + 1, mask, other=0).to(tl.uint16)
-        ws = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        packed = tl.load(
-            W + address[:, :, None] + 2 + groups[None, None, :],
+        ws = _pq2_scale(W, rows[:, None], block[None, :], N, K, STRIDE, mask, PREPARED)
+        packed = _pq2_codes(
+            W,
+            rows[:, None, None],
+            block[None, :, None],
+            groups[None, None, :],
+            K,
+            STRIDE,
             mask[:, :, None],
-            other=0,
+            PREPARED,
         ).to(tl.int32)
-        c0 = ((packed & 3) - 1) & 255
-        c1 = (((packed >> 2) & 3) - 1) & 255
-        c2 = (((packed >> 4) & 3) - 1) & 255
-        c3 = (((packed >> 6) & 3) - 1) & 255
-        w = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+        # Spread four 2-bit codes into bytes before converting 0/1/2/3 to
+        # signed -1/0/1/2. Each byte + 127 is <= 130, so no carry crosses
+        # a byte boundary. Unsigned arithmetic also handles the high byte.
+        spread = (packed & 3) | ((packed << 6) & 0x300)
+        spread |= ((packed << 12) & 0x30000) | ((packed << 18) & 0x3000000)
+        w = ((spread.to(tl.uint32) + 0x7F7F7F7F) ^ 0x80808080).to(tl.int32)
         dots = tl.inline_asm_elementwise(
             "dp4a.s32.s32 $0, $1, $2, 0;",
             constraints="=r,r,r",
@@ -82,11 +87,11 @@ def _int_gemv(
     )
 
 
-def pq2_int_gemv(x, weight):
+def pq2_int_gemv(x, weight, *, prepared=False):
     """Quantize once, then reuse packed words across up to sixteen tokens.
 
     Scratch: M*K INT8 bytes and M*K/128 FP32 scales. Activation approximation
-    requires model/quality acceptance before this API can enter serving.
+    requires model/quality acceptance before default serving adoption.
     """
     if x.ndim != 2 or weight.ndim != 2:
         raise ValueError("PQ2 integer GEMV requires two matrices")
@@ -106,6 +111,8 @@ def pq2_int_gemv(x, weight):
             "PQ2 integer GEMV requires floating activations and uint8 weights"
         )
     x = x.contiguous()
+    if prepared:
+        validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -125,6 +132,7 @@ def pq2_int_gemv(x, weight):
             triton.next_power_of_2(m),
             16,
             4,
+            prepared,
             num_warps=4,
         )
     return y

@@ -16,7 +16,11 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
-from ..hadamard import HadamardRuntimeConfig, PrismHadamardConfig, apply_inverse_hadamard
+from ..hadamard import (
+    HadamardRuntimeConfig,
+    PrismHadamardConfig,
+    apply_inverse_hadamard,
+)
 from .linear import GGUFLinearMethod
 from .params import (
     GGUFUninitializedWeightParameter,
@@ -83,7 +87,14 @@ def _apply_gguf_embedding(
     weight_type: int,
     hidden_size: int,
     dtype: torch.dtype | None = None,
+    pq2_prepared: bool = False,
 ) -> torch.Tensor:
+    if pq2_prepared:
+        if weight_type != WeightType.PQ2_0:
+            raise ValueError("Prepared embedding weights must be PQ2")
+        from ..triton.pq2_layout import pq2_prepared_embedding
+
+        return pq2_prepared_embedding(x, weight, hidden_size, dtype)
     if weight_type in UNQUANTIZED_TYPES:
         return torch.embedding(weight, x)
     if weight_type in DEQUANT_TYPES:
@@ -105,6 +116,7 @@ def _apply_gguf_embedding_fake(
     weight_type: int,
     hidden_size: int,
     dtype: torch.dtype | None = None,
+    pq2_prepared: bool = False,
 ) -> torch.Tensor:
     del weight, weight_type
     return torch.empty(*x.shape, hidden_size, dtype=dtype, device=x.device)
@@ -216,7 +228,8 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         weight_type = layer.weight_type.weight_type
         hidden_size = weight.tensor_shape[1]
         out = apply_gguf_embedding_op(
-            x, weight, weight_type, hidden_size, dtype=self.params_dtype
+            x, weight, weight_type, hidden_size, dtype=self.params_dtype,
+            pq2_prepared=getattr(weight, "gguf_pq2_prepared", False),
         )
 
 

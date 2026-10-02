@@ -127,8 +127,23 @@ def _register_omni_diffusion_quantization() -> None:
     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
 
 
+def _register_pq2_compile_factors() -> None:
+    # AOT loading happens before Dynamo can check tensor-attribute guards.
+    # Layout changes the custom-op arguments, so it must enter the vLLM cache
+    # key, rather than relying on a parameter attribute alone.
+    import vllm.envs as envs
+
+    from .quantization import linear
+
+    envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
+        linear._EXPERIMENTAL_PREPARED_PQ2
+    )
+    envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
+
+
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
+    _register_pq2_compile_factors()
     register_quantization_config("gguf")(GGUFConfig)
     _register_omni_diffusion_quantization()
 

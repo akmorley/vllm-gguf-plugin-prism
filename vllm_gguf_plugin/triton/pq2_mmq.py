@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
+
 
 @triton.jit
 def _quantize(X, Q, S, K: tl.constexpr):
@@ -38,6 +40,7 @@ def _mmq(
     STRIDE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    PREPARED: tl.constexpr = False,
 ):
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -47,12 +50,9 @@ def _mmq(
         a = tl.load(
             Q + m[:, None] * K + block * 128 + k[None, :], m[:, None] < M, other=0
         )
-        address = n * STRIDE + block * 34
-        lo = tl.load(W + address, n < N, other=0).to(tl.uint16)
-        hi = tl.load(W + address + 1, n < N, other=0).to(tl.uint16)
-        ws = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        packed = tl.load(
-            W + address[None, :] + 2 + k[:, None] // 4, n[None, :] < N, other=0
+        ws = _pq2_scale(W, n, block, N, K, STRIDE, n < N, PREPARED)
+        packed = _pq2_codes(
+            W, n[None, :], block, k[:, None] // 4, K, STRIDE, n[None, :] < N, PREPARED
         )
         b = (((packed.to(tl.int32) >> (2 * (k[:, None] % 4))) & 3) - 1).to(tl.int8)
         partial = tl.dot(a, b).to(tl.float32)
@@ -61,7 +61,7 @@ def _mmq(
     tl.store(Y + m[:, None] * N + n[None, :], acc, (m[:, None] < M) & (n[None, :] < N))
 
 
-def pq2_mmq(x, weight):
+def pq2_mmq(x, weight, *, prepared=False):
     """Quantize activations once and reuse across all output tiles.
 
     Additional activation approximation requires model-quality validation before
@@ -81,6 +81,8 @@ def pq2_mmq(x, weight):
     ):
         raise ValueError("PQ2 MMQ requires floating activations and uint8 weights")
     x = x.contiguous()
+    if prepared:
+        validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
@@ -89,6 +91,6 @@ def pq2_mmq(x, weight):
         scales = torch.empty((m, k // 128), dtype=torch.float32, device=x.device)
         _quantize[(m * (k // 128),)](x, q, scales, k)
         _mmq[(triton.cdiv(m, 64), triton.cdiv(n, 128))](
-            q, scales, weight, y, m, n, k, weight.stride(0), 64, 128
+            q, scales, weight, y, m, n, k, weight.stride(0), 64, 128, prepared
         )
     return y
