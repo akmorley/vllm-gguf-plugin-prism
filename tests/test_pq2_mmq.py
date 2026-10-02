@@ -7,10 +7,14 @@ from vllm_gguf_plugin.triton.pq2_mmq import pq2_mmq
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("activation_group", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("m,k", [(1, 128), (5, 384), (33, 640)])
 @pytest.mark.parametrize("strided", [False, True])
-def test_mmq_quantized_reference_and_graph(dtype, m, k, strided):
+def test_mmq_quantized_reference_and_graph(
+    dtype, m, k, strided, activation_group, prepared
+):
     torch.manual_seed(19)
     n = 37
     storage = torch.randint(
@@ -26,18 +30,22 @@ def test_mmq_quantized_reference_and_graph(dtype, m, k, strided):
     ).reshape(n, k // 128, 128)
     x = torch.randn(m, k, dtype=dtype, device="cuda")
     x[0] = 0
-    a = x.float().reshape(m, k // 128, 128)
+    a = x.float().reshape(m, k // activation_group, activation_group)
     xs = a.abs().amax(-1, keepdim=True) / 127
     q = torch.where(xs > 0, (a / xs).round().clamp(-127, 127), 0)
-    expected = torch.einsum(
-        "mbk,nbk->mn", q * xs, codes.float() * scales[:, :, None]
-    ).to(dtype)
+    dequantized_x = (q * xs).reshape(m, k)
+    dequantized_w = (codes.float() * scales[:, :, None]).reshape(n, k)
+    expected = (dequantized_x @ dequantized_w.T).to(dtype)
+    if prepared:
+        from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
+
+        w = prepare_pq2_layout(w)
     for _ in range(3):
-        actual = pq2_mmq(x, w)
+        actual = pq2_mmq(x, w, prepared=prepared, activation_group=activation_group)
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.002)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = pq2_mmq(x, w)
+        captured = pq2_mmq(x, w, prepared=prepared, activation_group=activation_group)
     graph.replay()
     torch.testing.assert_close(captured, expected, atol=0.02, rtol=0.002)
     # A replay must consume new activation values rather than captured Q8 data.
@@ -46,7 +54,8 @@ def test_mmq_quantized_reference_and_graph(dtype, m, k, strided):
     torch.testing.assert_close(captured, expected * 0.5, atol=0.02, rtol=0.002)
 
 
-def test_mmq_runtime_m_reuses_compilation():
+@pytest.mark.parametrize("activation_group", [32, 64, 128])
+def test_mmq_runtime_m_reuses_compilation(activation_group):
     from vllm_gguf_plugin.triton.pq2_mmq import _mmq
 
     n, k = 129, 384
@@ -58,7 +67,15 @@ def test_mmq_runtime_m_reuses_compilation():
     for m in (5, 8, 65, 128, 258):
         # Exactly representable Q8 values also test both grid boundary masks.
         x = torch.ones(m, k, device="cuda", dtype=torch.bfloat16)
-        actual = pq2_mmq(x, w.reshape(n, -1))
+        actual = pq2_mmq(x, w.reshape(n, -1), activation_group=activation_group)
         torch.testing.assert_close(actual, torch.full_like(actual, k), rtol=0, atol=0)
         sizes.append(sum(len(cache[0]) for cache in _mmq.device_caches.values()))
     assert len(set(sizes)) == 1, "M must not cause new MMQ compiled variants"
+
+
+@pytest.mark.parametrize("group", [0, 16, 48, 256, 32.0, "64", None])
+def test_mmq_rejects_unsupported_activation_group(group):
+    x = torch.zeros((1, 128), device="cuda")
+    w = torch.zeros((1, 34), device="cuda", dtype=torch.uint8)
+    with pytest.raises(ValueError, match="activation group"):
+        pq2_mmq(x, w, activation_group=group)

@@ -12,6 +12,10 @@ from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 # Read once before graph capture; opt-in while model/serving acceptance is pending.
 _EXPERIMENTAL_BATCHED_GEMV = os.environ.get("GGUF_PQ2_BATCHED_GEMV", "0") == "1"
 _EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
+_EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
+_MMQ_ACTIVATION_GROUP = int(os.environ.get("GGUF_PQ2_MMQ_GROUP", "128"))
+if _MMQ_ACTIVATION_GROUP not in (32, 64, 128):
+    raise ValueError("GGUF_PQ2_MMQ_GROUP must be 32, 64 or 128")
 _BATCHED_GEMV_SHAPES = frozenset(
     {(34816, 5120), (5120, 17408), (16384, 5120), (14336, 5120), (248320, 5120)}
 )
@@ -166,6 +170,23 @@ def pq2_matmul(x, weight, *, prepared=False):
         if prepared:
             return pq2_batched_gemv(x, weight, prepared=True)
         return pq2_batched_gemv(x, weight)
+    # M>=128 is the measured large-prefill range. Small/decode batches keep
+    # their existing path; this default-off experiment changes activations.
+    if (
+        _EXPERIMENTAL_MMQ
+        and m >= 128
+        and (n, k) in _BATCHED_GEMV_SHAPES
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    ):
+        from .pq2_mmq import pq2_mmq
+
+        if _MMQ_ACTIVATION_GROUP == 128:
+            return pq2_mmq(x, weight, prepared=prepared)
+        return pq2_mmq(
+            x, weight, prepared=prepared, activation_group=_MMQ_ACTIVATION_GROUP
+        )
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
     if m and n and m <= 4 and k <= 32768:
         _pq2_gemv[(n, m)](

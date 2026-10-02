@@ -134,11 +134,19 @@ def _register_pq2_compile_factors() -> None:
     import vllm.envs as envs
 
     from .quantization import linear
+    from .triton import prism
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
     )
     envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
+    envs.environment_variables["GGUF_PQ2_MMQ"] = lambda: prism._EXPERIMENTAL_MMQ
+    envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
+        "q8-groups-m128-byte32-v3"
+    )
+    envs.environment_variables["GGUF_PQ2_MMQ_GROUP"] = lambda: (
+        prism._MMQ_ACTIVATION_GROUP
+    )
 
 
 def register() -> None:
