@@ -143,7 +143,9 @@ def test_integer_gemv_masks_tokens_and_reuses_runtime_m():
     sizes = []
     for m in (5, 7, 8):
         x = torch.ones(m, k, dtype=torch.bfloat16, device="cuda")
-        result = pq2_int_gemv(x, w.reshape(n, -1))
+        # Hold the kernel algorithm fixed: the M8 default intentionally uses
+        # chaining, which has its own specialization and separate tests.
+        result = pq2_int_gemv(x, w.reshape(n, -1), chained=False)
         torch.testing.assert_close(
             result, torch.full_like(result, k / 2), rtol=0, atol=0
         )

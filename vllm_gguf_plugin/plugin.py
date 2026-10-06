@@ -134,7 +134,7 @@ def _register_pq2_compile_factors() -> None:
     import vllm.envs as envs
 
     from .quantization import linear
-    from .triton import prism
+    from .triton import pq2_int_gemv, prism
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -147,6 +147,29 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_MMQ_GROUP"] = lambda: (
         prism._MMQ_ACTIVATION_GROUP
     )
+
+    # Record resolved import-time choices, including defaults, in AOT cache keys.
+    envs.environment_variables["GGUF_PQ2_INT_GEMV"] = lambda: (
+        prism._EXPERIMENTAL_INT_GEMV
+    )
+    envs.environment_variables["GGUF_PQ2_INT_OUTPUT"] = lambda: (
+        prism._EXPERIMENTAL_INT_OUTPUT
+    )
+    envs.environment_variables["GGUF_PQ2_INT_GEMV_VARIANT"] = lambda: (
+        pq2_int_gemv._VARIANT
+    )
+    envs.environment_variables["GGUF_PQ2_INT_GEMV_DECODE"] = lambda: pq2_int_gemv._DECODE
+    envs.environment_variables["GGUF_PQ2_INT_GEMV_CHAINED"] = lambda: (
+        pq2_int_gemv._CHAINED
+    )
+    envs.environment_variables["GGUF_PQ2_BATCH8_CHAINED"] = lambda: (
+        pq2_int_gemv._BATCH8_CHAINED
+    )
+    envs.environment_variables["GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM"] = lambda: (
+        prism._BATCH8_FLOAT_OUTPUT_BM
+    )
+    envs.environment_variables["GGUF_PQ2_SINGLE_GEMV"] = lambda: pq2_int_gemv._SINGLE_GEMV
+    envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: "batch8-chained-single-byte-default-v4"
 
 
 def register() -> None:

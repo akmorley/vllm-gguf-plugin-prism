@@ -111,3 +111,26 @@ throughput, latency percentiles, GPU memory samples, and raw vLLM results.
 The [experimental PQ2 integer decode guide](benchmarks/PQ2_INTEGER_DECODE.md)
 documents the default-off `GGUF_PQ2_INT_GEMV=1` experiment, measured dispatch
 rules, kernel results, and numerical acceptance work.
+
+## PQ2 single-request decode defaults
+
+The optimized PQ2 decode path now defaults to the prepared single-token byte
+kernel (`GGUF_PQ2_SINGLE_GEMV=1`) and `shape-tuned-v2` geometry
+(`GGUF_PQ2_INT_GEMV_VARIANT=shape-tuned-v2`). These choices apply when the
+existing integer-decode path is enabled. For the tested optimized serving
+configuration, use `GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`, and
+`GGUF_PQ2_MMQ=1` (MMQ group 128). The two new default flags need no overrides.
+
+The single-token specialization selects only the six measured projection
+shapes on SM86 with BF16/FP16, prepared weights, PRMT decode, and disabled
+chained and fused-gate paths. Other inputs retain their existing dispatch.
+Batch-eight chaining and the BM8 floating output projection are included from
+the validated optimized configuration. Resolved settings and the kernel
+version enter the compilation cache identity.
+
+To restore the prior single-token implementation and geometry, set
+`GGUF_PQ2_SINGLE_GEMV=0` and `GGUF_PQ2_INT_GEMV_VARIANT=shape-tuned`.
+The experimental attention split override is not enabled by this promotion.
+
+Full-model measurements with 4096 input and 2048 generated tokens showed
+18.22% and 17.62% higher generation throughput on the two RTX 3090 Ti GPUs.

@@ -12,8 +12,12 @@ from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 # Read once before graph capture; opt-in while model/serving acceptance is pending.
 _EXPERIMENTAL_BATCHED_GEMV = os.environ.get("GGUF_PQ2_BATCHED_GEMV", "0") == "1"
 _EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
+_EXPERIMENTAL_INT_OUTPUT = os.environ.get("GGUF_PQ2_INT_OUTPUT", "1") == "1"
 _EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
 _MMQ_ACTIVATION_GROUP = int(os.environ.get("GGUF_PQ2_MMQ_GROUP", "128"))
+_BATCH8_FLOAT_OUTPUT_BM = int(os.environ.get("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM", "8"))
+if _BATCH8_FLOAT_OUTPUT_BM not in (8, 16, 32, 64):
+    raise ValueError("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM must be 8, 16, 32 or 64")
 if _MMQ_ACTIVATION_GROUP not in (32, 64, 128):
     raise ValueError("GGUF_PQ2_MMQ_GROUP must be 32, 64 or 128")
 _BATCHED_GEMV_SHAPES = frozenset(
@@ -37,7 +41,8 @@ def _use_int_gemv(x, n, k):
     return (
         _EXPERIMENTAL_INT_GEMV
         and x.shape[0] in (1, 2, 4, 5, 8)
-        and (n, k) in _BATCHED_GEMV_SHAPES
+        and ((n, k) in _BATCHED_GEMV_SHAPES
+             or (_EXPERIMENTAL_INT_OUTPUT and (n, k) == (5120, 6144) and x.shape[0] == 1))
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.is_cuda
         and torch.cuda.get_device_capability(x.device) == (8, 6)
@@ -193,7 +198,13 @@ def pq2_matmul(x, weight, *, prepared=False):
             x, weight, y, n, k, weight.stride(0), triton.next_power_of_2(k), prepared
         )
     elif m and n:
-        _pq2[(triton.cdiv(m, 64), triton.cdiv(n, 64))](
+        bm = _BATCH8_FLOAT_OUTPUT_BM if (
+            m == 8 and (n, k) == (5120, 6144)
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.is_cuda
+            and torch.cuda.get_device_capability(x.device) == (8, 6)
+        ) else 64
+        _pq2[(triton.cdiv(m, bm), triton.cdiv(n, 64))](
             x,
             weight,
             y,
@@ -201,7 +212,7 @@ def pq2_matmul(x, weight, *, prepared=False):
             n,
             k,
             weight.stride(0),
-            64,
+            bm,
             64,
             128,
             prepared,
