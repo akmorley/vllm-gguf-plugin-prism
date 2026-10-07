@@ -6,7 +6,6 @@ import pytest
 import torch
 from gguf import GGMLQuantizationType
 
-from vllm_gguf_plugin.triton.pq2_gemv import pq2_batched_gemv
 from vllm_gguf_plugin.triton.pq2_int_gemv import pq2_int_gemv
 from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
 from vllm_gguf_plugin.triton.pq2_mmq import pq2_mmq
@@ -51,10 +50,10 @@ def test_prepared_bytes_and_single_allocation(k, strides):
     "m,k", [(1, 128), (3, 384), (4, 640), (5, 1024), (8, 5120), (16, 17408), (65, 384)]
 )
 @pytest.mark.parametrize(
-    "method", [pq2_matmul, pq2_int_gemv, pq2_batched_gemv, pq2_mmq]
+    "method", [pq2_matmul, pq2_int_gemv, pq2_mmq]
 )
 def test_prepared_paths_bitwise_and_graph(dtype, m, k, method):
-    if m > 16 and method in (pq2_int_gemv, pq2_batched_gemv):
+    if m > 16 and method is pq2_int_gemv:
         pytest.skip("Decode APIs accept at most 16 tokens")
     w = weight(9, k)
     prepared = prepare_pq2_layout(w)

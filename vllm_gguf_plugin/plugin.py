@@ -168,9 +168,6 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
         "q8-groups-m128-byte32-v3"
     )
-    envs.environment_variables["GGUF_PQ2_MMQ_GROUP"] = lambda: (
-        prism._MMQ_ACTIVATION_GROUP
-    )
 
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
         attention._SINGLE_ATTN_BACKEND
@@ -189,20 +186,8 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_INT_OUTPUT"] = lambda: (
         prism._EXPERIMENTAL_INT_OUTPUT
     )
-    envs.environment_variables["GGUF_PQ2_INT_GEMV_VARIANT"] = lambda: (
-        pq2_int_gemv._VARIANT
-    )
-    envs.environment_variables["GGUF_PQ2_INT_GEMV_DECODE"] = lambda: (
-        pq2_int_gemv._DECODE
-    )
-    envs.environment_variables["GGUF_PQ2_INT_GEMV_CHAINED"] = lambda: (
-        pq2_int_gemv._CHAINED
-    )
     envs.environment_variables["GGUF_PQ2_BATCH8_CHAINED"] = lambda: (
         pq2_int_gemv._BATCH8_CHAINED
-    )
-    envs.environment_variables["GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM"] = lambda: (
-        prism._BATCH8_FLOAT_OUTPUT_BM
     )
     envs.environment_variables["GGUF_PQ2_SINGLE_GEMV"] = lambda: (
         pq2_int_gemv._SINGLE_GEMV
@@ -216,14 +201,11 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
         pq2_small_mmq._SMALL_MMQ_OUTPUT
     )
-    envs.environment_variables["GGUF_PQ2_BATCH8_SMALL_MMQ"] = lambda: (
-        pq2_small_mmq._BATCH8_SMALL_MMQ
-    )
-    envs.environment_variables["GGUF_PQ2_BATCH8_SMALL_MMQ_VERSION"] = lambda: (
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_VERSION"] = lambda: (
         pq2_small_mmq._VERSION
     )
     envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: (
-        "batch8-chained-single-byte-default-v4"
+        "prmt-v2-tiles-batch8-chained-v5"
     )
 
 

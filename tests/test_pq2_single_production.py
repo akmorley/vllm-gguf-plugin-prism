@@ -40,22 +40,20 @@ def test_single_fallbacks(monkeypatch):
     n,k=5120,6144
     raw=torch.zeros(n,k//128*34,device='cuda',dtype=torch.uint8)
     prepared=prepare_pq2_layout(raw)
-    for m,dtype,layout,decode,chained,gated in (
-        (1,torch.bfloat16,True,'prmt',False,False),
-        (2,torch.bfloat16,True,'prmt',False,False),
-        (1,torch.float32,True,'prmt',False,False),
-        (1,torch.bfloat16,False,'prmt',False,False),
-        (1,torch.bfloat16,True,'shift',False,False),
-        (1,torch.bfloat16,True,'prmt',True,False),
-        (1,torch.bfloat16,True,'prmt',False,True)):
+    for m,dtype,layout,chained in (
+        (1,torch.bfloat16,True,False),
+        (2,torch.bfloat16,True,False),
+        (1,torch.float32,True,False),
+        (1,torch.bfloat16,False,False),
+        (1,torch.bfloat16,True,True)):
         x=torch.ones(m,k,device='cuda',dtype=dtype)
         q=torch.zeros(m,k,device='cuda',dtype=torch.int8)
         s=torch.ones(m,k//128,device='cuda',dtype=torch.float32)
-        integer.pq2_int_gemv(x,prepared if layout else raw,prepared=layout,decode=decode,
-                              chained=chained,gated=gated,quantized=(q,s))
-    assert calls==['single']+['generic']*6
+        integer.pq2_int_gemv(x,prepared if layout else raw,prepared=layout,
+                              chained=chained,quantized=(q,s))
+    assert calls==['single']+['generic']*4
     monkeypatch.setattr(torch.cuda,'get_device_capability',lambda device:(9,0))
-    integer.pq2_int_gemv(x,prepared,prepared=True,decode='prmt',chained=False,quantized=(q,s))
+    integer.pq2_int_gemv(x,prepared,prepared=True,chained=False,quantized=(q,s))
     assert calls[-1]=='generic'
 
 
@@ -66,7 +64,7 @@ def test_single_resolved_compile_identity(monkeypatch):
     for enabled in (False,True):
         monkeypatch.setattr(integer,'_SINGLE_GEMV',enabled)
         assert envs.environment_variables['GGUF_PQ2_SINGLE_GEMV']()==enabled
-    assert envs.environment_variables['GGUF_PQ2_INT_GEMV_VERSION']()=='batch8-chained-single-byte-default-v4'
+    assert envs.environment_variables['GGUF_PQ2_INT_GEMV_VERSION']()=='prmt-v2-tiles-batch8-chained-v5'
 
 
 def test_promoted_defaults_in_fresh_process():
@@ -76,14 +74,13 @@ def test_promoted_defaults_in_fresh_process():
     import sys
 
     env=dict(os.environ)
-    for key in ('GGUF_PQ2_SINGLE_GEMV','GGUF_PQ2_INT_GEMV_VARIANT','GGUF_PQ2_INT_GEMV_DECODE'):
-        env.pop(key,None)
-    code='from vllm_gguf_plugin.triton import pq2_int_gemv as m; import json; print(json.dumps([m._SINGLE_GEMV,m._VARIANT,m._DECODE]))'
+    env.pop('GGUF_PQ2_SINGLE_GEMV',None)
+    code='from vllm_gguf_plugin.triton import pq2_int_gemv as m; import json; print(json.dumps([m._SINGLE_GEMV,m._SINGLE_TILES[(16384,5120)]]))'
     output=subprocess.check_output([sys.executable,'-c',code],env=env,text=True)
-    assert json.loads(output.strip().splitlines()[-1])==[True,'shape-tuned-v2','prmt']
-    env.update(GGUF_PQ2_SINGLE_GEMV='0',GGUF_PQ2_INT_GEMV_VARIANT='shape-tuned')
+    assert json.loads(output.strip().splitlines()[-1])==[True,[16,8]]
+    env.update(GGUF_PQ2_SINGLE_GEMV='0')
     output=subprocess.check_output([sys.executable,'-c',code],env=env,text=True)
-    assert json.loads(output.strip().splitlines()[-1])==[False,'shape-tuned','prmt']
+    assert json.loads(output.strip().splitlines()[-1])==[False,[16,8]]
 
 
 def _single_attention_inputs():

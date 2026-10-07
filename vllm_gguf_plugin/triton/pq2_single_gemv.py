@@ -19,7 +19,7 @@ def _load_tile(W, WS, rows, blocks, N: tl.constexpr, K: tl.constexpr):
 def _consume(Q,S,packed,ws,blocks,K:tl.constexpr):
     words=tl.arange(0,32)
     q=tl.load(Q+blocks[:,None]*32+words[None,:],blocks[:,None]<K//128,other=0)
-    w=_decode_codes(packed,True)
+    w=_decode_codes(packed)
     dots=tl.inline_asm_elementwise('dp4a.s32.s32 $0, $1, $2, 0;',
           constraints='=r,r,r',args=[q[None,:,:],w],dtype=tl.int32,is_pure=True,pack=1)
     partial=tl.sum(dots,2).to(tl.float32)

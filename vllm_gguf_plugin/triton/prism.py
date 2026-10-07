@@ -10,33 +10,15 @@ import triton.language as tl
 from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 
 # Read once before graph capture; opt-in while model/serving acceptance is pending.
-_EXPERIMENTAL_BATCHED_GEMV = os.environ.get("GGUF_PQ2_BATCHED_GEMV", "0") == "1"
 _EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
 _EXPERIMENTAL_INT_OUTPUT = os.environ.get("GGUF_PQ2_INT_OUTPUT", "1") == "1"
 _EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
-_MMQ_ACTIVATION_GROUP = int(os.environ.get("GGUF_PQ2_MMQ_GROUP", "128"))
-_BATCH8_FLOAT_OUTPUT_BM = int(os.environ.get("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM", "8"))
 # Bit-exact: smaller floating row tiles for (5120, 6144) at M = 5..16 (8 rows up to M = 8,
-# 16 rows above), instead of padding to 64. Extends the batch-eight rule to verification sizes.
+# 16 rows above), instead of padding to 64.
 _SMALL_FLOAT_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_FLOAT_OUTPUT", "1") == "1"
-if _BATCH8_FLOAT_OUTPUT_BM not in (8, 16, 32, 64):
-    raise ValueError("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM must be 8, 16, 32 or 64")
-if _MMQ_ACTIVATION_GROUP not in (32, 64, 128):
-    raise ValueError("GGUF_PQ2_MMQ_GROUP must be 32, 64 or 128")
 _BATCHED_GEMV_SHAPES = frozenset(
     {(34816, 5120), (5120, 17408), (16384, 5120), (14336, 5120), (248320, 5120)}
 )
-
-
-def _use_batched_gemv(x, n, k):
-    return (
-        _EXPERIMENTAL_BATCHED_GEMV
-        and x.shape[0] == 4
-        and (n, k) in _BATCHED_GEMV_SHAPES
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and x.is_cuda
-        and torch.cuda.get_device_capability(x.device) == (8, 6)
-    )
 
 
 def _use_int_gemv(x, n, k):
@@ -177,12 +159,6 @@ def pq2_matmul(x, weight, *, prepared=False):
         if prepared:
             return pq2_int_gemv(x, weight, prepared=True)
         return pq2_int_gemv(x, weight)
-    if _use_batched_gemv(x, n, k):
-        from .pq2_gemv import pq2_batched_gemv
-
-        if prepared:
-            return pq2_batched_gemv(x, weight, prepared=True)
-        return pq2_batched_gemv(x, weight)
     # M>=128 is the measured large-prefill range. Small/decode batches keep
     # their existing path; this default-off experiment changes activations.
     if (
@@ -195,11 +171,7 @@ def pq2_matmul(x, weight, *, prepared=False):
     ):
         from .pq2_mmq import pq2_mmq
 
-        if _MMQ_ACTIVATION_GROUP == 128:
-            return pq2_mmq(x, weight, prepared=prepared)
-        return pq2_mmq(
-            x, weight, prepared=prepared, activation_group=_MMQ_ACTIVATION_GROUP
-        )
+        return pq2_mmq(x, weight, prepared=prepared)
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
     # With the small-batch opt-in, M = 2..4 floating output projections use the 8-row tile
     # instead of the per-token GEMV (which re-reads the weights for every token). Floating
@@ -222,9 +194,7 @@ def pq2_matmul(x, weight, *, prepared=False):
             and x.is_cuda
             and torch.cuda.get_device_capability(x.device) == (8, 6)
         )
-        if small_output and m == 8:
-            bm = _BATCH8_FLOAT_OUTPUT_BM
-        elif small_output and _SMALL_FLOAT_OUTPUT and 5 <= m <= 16:
+        if small_output and _SMALL_FLOAT_OUTPUT and 5 <= m <= 16:
             bm = 8 if m <= 8 else 16
         elif tile_output:
             bm = 8

@@ -19,15 +19,15 @@ def test_float_output_tile_exact_and_graph(monkeypatch,dtype,prepared):
     if prepared:w=prepare_pq2_layout(w)
     x=torch.randn(8,k,device='cuda',dtype=dtype)
     monkeypatch.setattr(prism,'_EXPERIMENTAL_INT_GEMV',False)
-    monkeypatch.setattr(prism,'_BATCH8_FLOAT_OUTPUT_BM',64)
+    monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',False)
     expected=prism.pq2_matmul(x,w,prepared=prepared)
-    monkeypatch.setattr(prism,'_BATCH8_FLOAT_OUTPUT_BM',8)
+    monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',True)
     for _ in range(3):actual=prism.pq2_matmul(x,w,prepared=prepared)
     torch.testing.assert_close(actual,expected,atol=0,rtol=0)
     graph=torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):actual=prism.pq2_matmul(x,w,prepared=prepared)
     x.mul_(0.5).add_(0.03)
-    monkeypatch.setattr(prism,'_BATCH8_FLOAT_OUTPUT_BM',64)
+    monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',False)
     expected=prism.pq2_matmul(x,w,prepared=prepared)
     graph.replay()
     torch.testing.assert_close(actual,expected,atol=0,rtol=0)
@@ -37,10 +37,9 @@ def test_chained_default_scope_and_explicit_override(monkeypatch):
     observed=[]
     class Probe:
         def __getitem__(self,grid):
-            def run(*args,**kwargs):observed.append(args[13])
+            def run(*args,**kwargs):observed.append(args[12])
             return run
     monkeypatch.setattr(integer,'_int_gemv',Probe())
-    monkeypatch.setattr(integer,'_CHAINED',False)
     monkeypatch.setattr(integer,'_BATCH8_CHAINED',True)
     monkeypatch.setattr(torch.cuda,'get_device_capability',lambda device:(8,6))
     w=torch.zeros(9,34,device='cuda',dtype=torch.uint8)
@@ -59,8 +58,11 @@ def test_resolved_settings_enter_compile_identity(monkeypatch):
     import vllm.envs as envs
     from vllm_gguf_plugin.plugin import _register_pq2_compile_factors
     _register_pq2_compile_factors()
-    for chain,bm in ((False,64),(True,8)):
+    for chain,small in ((False,False),(True,True)):
         monkeypatch.setattr(integer,'_BATCH8_CHAINED',chain)
-        monkeypatch.setattr(prism,'_BATCH8_FLOAT_OUTPUT_BM',bm)
+        monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',small)
         assert envs.environment_variables['GGUF_PQ2_BATCH8_CHAINED']()==chain
-        assert envs.environment_variables['GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM']()==bm
+        assert envs.environment_variables['GGUF_PQ2_SMALL_FLOAT_OUTPUT']()==small
+    for removed in ('GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM','GGUF_PQ2_INT_GEMV_VARIANT','GGUF_PQ2_INT_GEMV_DECODE',
+                    'GGUF_PQ2_INT_GEMV_CHAINED','GGUF_PQ2_MMQ_GROUP','GGUF_PQ2_BATCH8_SMALL_MMQ'):
+        assert removed not in envs.environment_variables

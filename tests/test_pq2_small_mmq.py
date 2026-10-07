@@ -28,7 +28,6 @@ def _rel_rms(a,b):
 def enabled(monkeypatch):
     monkeypatch.setattr(prism,'_EXPERIMENTAL_INT_GEMV',True)
     monkeypatch.setattr(small,'_SMALL_MMQ',True)
-    monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',False)
 
 
 @pytest.mark.parametrize('dtype',[torch.bfloat16,torch.float16])
@@ -69,13 +68,10 @@ def test_dispatch_scope(monkeypatch):
     m8=sorted(small.GEOMETRY_BY_M[8])[0];w=_weight(*m8);k=m8[1]
     def run(m,dtype=torch.bfloat16,prepared=True):
         prism.pq2_matmul(torch.randn(m,k,device='cuda',dtype=dtype),w,prepared=prepared)
-    monkeypatch.setattr(small,'_SMALL_MMQ',False);monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',False)
+    monkeypatch.setattr(small,'_SMALL_MMQ',False)
     for m in (1,4,8,16):run(m)
     assert calls==[]
-    monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',True)
-    for m in (1,4,8,16):run(m)
-    assert calls==[8]                              # narrow switch: M = 8 only
-    calls.clear();monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',False);monkeypatch.setattr(small,'_SMALL_MMQ',True)
+    monkeypatch.setattr(small,'_SMALL_MMQ',True)
     expected=[m for m in range(1,18) if 2<=m<=16 and (small.geometry_for(m,*m8) is not None or small.cuda_for(m,*m8) is not None)]
     for m in range(1,18):run(m)
     assert calls==expected and 1 not in calls and 17 not in calls
@@ -87,16 +83,15 @@ def test_resolved_settings_enter_compile_identity(monkeypatch):
     from vllm_gguf_plugin.plugin import _register_pq2_compile_factors
     _register_pq2_compile_factors()
     for enabled in (False,True):
-        monkeypatch.setattr(small,'_SMALL_MMQ',enabled);monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',not enabled)
+        monkeypatch.setattr(small,'_SMALL_MMQ',enabled)
         assert envs.environment_variables['GGUF_PQ2_SMALL_MMQ']()==enabled
-        assert envs.environment_variables['GGUF_PQ2_BATCH8_SMALL_MMQ']()==(not enabled)
-    assert envs.environment_variables['GGUF_PQ2_BATCH8_SMALL_MMQ_VERSION']()==small._VERSION
+    assert envs.environment_variables['GGUF_PQ2_SMALL_MMQ_VERSION']()==small._VERSION
 
 
 @pytest.mark.parametrize('m',[5,6,7,9,12,16])
 def test_small_float_output_tile_is_bit_exact(monkeypatch,m):
     n,k=5120,6144;w=_weight(n,k);x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
-    monkeypatch.setattr(small,'_SMALL_MMQ',False);monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',False)
+    monkeypatch.setattr(small,'_SMALL_MMQ',False)
     monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',False)
     expected=prism.pq2_matmul(x,w,prepared=True)
     monkeypatch.setattr(prism,'_SMALL_FLOAT_OUTPUT',True)

@@ -7,7 +7,7 @@ but are stored in plane order (k = byte * 4 + s -> s * 32 + byte), so each plane
 byte multiplies a contiguous slice. Plane s is `byte & (3 << 2s)` = code * 4^s; the exact
 INT32 product is shifted back, and the ternary -1 offset is applied once per group as -sum(q).
 INT32 group sums equal the DP4A kernel's; only FP32 accumulation order differs.
-Serving use is opt-in: GGUF_PQ2_SMALL_MMQ=1 (M = 2..16) or GGUF_PQ2_BATCH8_SMALL_MMQ=1 (M = 8).
+Serving use is opt-in: GGUF_PQ2_SMALL_MMQ=1 (M = 2..16).
 """
 import os
 
@@ -16,9 +16,7 @@ import triton
 import triton.language as tl
 
 # GGUF_PQ2_SMALL_MMQ=1 enables M = 2..16 (speculative verification, small batches).
-# GGUF_PQ2_BATCH8_SMALL_MMQ=1 is the earlier, narrower switch: M = 8 only.
 _SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "0") == "1"
-_BATCH8_SMALL_MMQ = os.environ.get("GGUF_PQ2_BATCH8_SMALL_MMQ", "0") == "1"
 # Opt-in: also route the (5120, 6144) output projections (M = 2..8) through the INT8 CUDA kernel.
 # This is the Q8 treatment production already applies at M = 1 (GGUF_PQ2_INT_OUTPUT), but it
 # changes the floating M >= 2 outputs by ~0.7% relative RMS.
@@ -83,7 +81,6 @@ GEOMETRY_BY_M = {
         (248320, 5120): (128, 2, 4, 4, 1),
     },
 }
-GEOMETRY = GEOMETRY_BY_M[8]
 
 
 def geometry_for(m, n, k):
@@ -250,7 +247,7 @@ def eligible(x, weight, prepared):
     if not prepared or x.ndim != 2 or not x.is_cuda:
         return False
     m = x.shape[0]
-    enabled = (_SMALL_MMQ and 2 <= m <= 16) or (_BATCH8_SMALL_MMQ and m == 8)
+    enabled = _SMALL_MMQ and 2 <= m <= 16
     return (
         enabled
         and x.dtype in (torch.bfloat16, torch.float16)
