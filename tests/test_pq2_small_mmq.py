@@ -3,6 +3,7 @@ import pytest
 import torch
 from vllm_gguf_plugin.triton import prism, pq2_int_gemv as integer, pq2_small_mmq as small
 from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
+from vllm_gguf_plugin.triton.pq2_mmq import pq2_mmq
 
 pytestmark=pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(8,6),
                               reason='SM86 CUDA required')
@@ -34,7 +35,8 @@ def enabled(monkeypatch):
 @pytest.mark.parametrize('m,n,k',CASES)
 def test_matches_q8_integer_and_is_deterministic(enabled,dtype,m,n,k):
     w=_weight(n,k);x=torch.randn(m,k,device='cuda',dtype=dtype)
-    expected=integer.pq2_int_gemv(x,w,prepared=True,chained=False)  # same Q8 arithmetic
+    # Same Q8 group-128 arithmetic: the integer GEMV up to 16 rows, the MMQ kernel above.
+    expected=integer.pq2_int_gemv(x,w,prepared=True,chained=False) if m<=16 else pq2_mmq(x,w,prepared=True)
     first=prism.pq2_matmul(x,w,prepared=True)
     assert _rel_rms(first,expected)<2e-4
     for _ in range(2):torch.testing.assert_close(prism.pq2_matmul(x,w,prepared=True),first,atol=0,rtol=0)
@@ -72,9 +74,9 @@ def test_dispatch_scope(monkeypatch):
     for m in (1,4,8,16):run(m)
     assert calls==[]
     monkeypatch.setattr(small,'_SMALL_MMQ',True)
-    expected=[m for m in range(1,18) if 2<=m<=16 and (small.geometry_for(m,*m8) is not None or small.cuda_for(m,*m8) is not None)]
-    for m in range(1,18):run(m)
-    assert calls==expected and 1 not in calls and 17 not in calls
+    expected=[m for m in range(1,66) if 2<=m<=64 and (small.geometry_for(m,*m8) is not None or small.cuda_for(m,*m8) is not None)]
+    for m in range(1,66):run(m)
+    assert calls==expected and 1 not in calls and 65 not in calls
     calls.clear();run(8,dtype=torch.float32);assert calls==[]  # floating-point activations excluded
 
 
@@ -114,3 +116,11 @@ def test_cuda_kernel_matches_triton_and_falls_back(enabled,monkeypatch,m,n,k):
         assert not small.eligible(x,w,True)       # falls back to the production path
     else:
         torch.testing.assert_close(prism.pq2_matmul(x,w,prepared=True),triton_out,atol=0,rtol=0)
+
+
+@pytest.mark.parametrize('m',[17,24,33,48,64])
+def test_wide_buckets_match_mmq(enabled,m):
+    n,k=16384,5120
+    w=_weight(n,k);x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+    assert small.geometry_for(m,n,k)==small.GEOMETRY_BY_M[32 if m<=32 else 64][(n,k)]
+    assert _rel_rms(prism.pq2_matmul(x,w,prepared=True),pq2_mmq(x,w,prepared=True))<2e-4

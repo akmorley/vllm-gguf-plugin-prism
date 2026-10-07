@@ -23,10 +23,11 @@ _SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "0") == "1"
 _SMALL_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_MMQ_OUTPUT", "0") == "1"
 OUTPUT_CUDA = (2, 8)  # (warps, groups in flight), RTX 3090 Ti microbenchmark, M = 2..8
 _VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v1"
+_MAX_M = 64
 _CALLS = 0  # Python-side launches (warmup and graph capture); replay does not re-enter.
 # M -> (N, K) -> (rows per program, groups per iteration, warps, pipeline stages, K splits).
 # Selected on real captured rows, RTX 3090: pq2-small-mmq-screen-20261007-masked (M = 8)
-# and pq2-small-mmq-mscreen-20261007 (other M). M = 9..15 use the M = 16 table.
+# and pq2-small-mmq-mscreen-20261007 (other M). Buckets: M = 9..16, 17..32, 33..64.
 GEOMETRY_BY_M = {
     2: {
         (248320, 5120): (128, 2, 4, 3, 1),
@@ -80,11 +81,34 @@ GEOMETRY_BY_M = {
         (34816, 5120): (128, 2, 4, 2, 1),
         (248320, 5120): (128, 2, 4, 4, 1),
     },
+    32: {  # token tile 32: M = 17..32 (synthetic sweep, RTX 3090 Ti)
+        (5120, 17408): (128, 2, 4, 2, 4),
+        (14336, 5120): (128, 1, 4, 3, 1),
+        (16384, 5120): (128, 1, 4, 2, 1),
+        (34816, 5120): (128, 1, 4, 2, 1),
+        (248320, 5120): (128, 1, 4, 3, 1),
+    },
+    64: {  # token tile 64: M = 33..64 (synthetic sweep, RTX 3090 Ti)
+        (5120, 17408): (128, 2, 4, 2, 2),
+        (14336, 5120): (128, 1, 4, 2, 1),
+        (16384, 5120): (128, 1, 4, 2, 1),
+        (34816, 5120): (128, 2, 4, 2, 1),
+        (248320, 5120): (128, 2, 4, 2, 1),
+    },
 }
 
 
+def _bucket(m):
+    # Exact tables for M <= 8; above that, one table per token tile (16, 32 or 64 rows).
+    return m if m <= 8 else 16 if m <= 16 else 32 if m <= 32 else 64
+
+
+def _token_tile(m):
+    return 16 if m <= 16 else 32 if m <= 32 else 64
+
+
 def geometry_for(m, n, k):
-    table = GEOMETRY_BY_M.get(16 if 8 < m <= 16 else m)
+    table = GEOMETRY_BY_M.get(_bucket(m))
     return None if table is None else table.get((n, k))
 
 
@@ -193,11 +217,10 @@ def _quantize_fragments(X, Q, S, T, K: tl.constexpr):
 @triton.jit(do_not_specialize=["M"])
 def _small_mmq_masked(Q, S, T, W, WS, Y, M, N: tl.constexpr, K: tl.constexpr,
                       BN: tl.constexpr, G: tl.constexpr, STAGES: tl.constexpr,
-                      SPLIT: tl.constexpr = 1):
+                      SPLIT: tl.constexpr = 1, BT: tl.constexpr = 16):
     """Codes stay in place: plane s is `byte & (3 << 2s)` = code * 4^s (plane 3 pre-shifted
     by 2 to stay below 128). The exact INT32 product is shifted back, and the ternary -1
     offset is applied once per group as -sum(q). Integer result equals the DP4A kernel's."""
-    BT: tl.constexpr = 16
     GROUPS: tl.constexpr = K // 128
     rows = tl.program_id(0) * BN + tl.arange(0, BN)
     tokens = tl.arange(0, BT)
@@ -247,7 +270,7 @@ def eligible(x, weight, prepared):
     if not prepared or x.ndim != 2 or not x.is_cuda:
         return False
     m = x.shape[0]
-    enabled = _SMALL_MMQ and 2 <= m <= 16
+    enabled = _SMALL_MMQ and 2 <= m <= _MAX_M
     return (
         enabled
         and x.dtype in (torch.bfloat16, torch.float16)
@@ -258,7 +281,7 @@ def eligible(x, weight, prepared):
 
 
 def pq2_small_mmq(x, weight, geometry=None):
-    """x: (M <= 16, K) floating, already rotated; weight: prepared PQ2 planes."""
+    """x: (M <= 64, K) floating, already rotated; weight: prepared PQ2 planes."""
     global _CALLS
     _CALLS += 1
     m, k = x.shape
@@ -267,8 +290,8 @@ def pq2_small_mmq(x, weight, geometry=None):
     if cuda is not None:
         return _pq2_mma_small(x, weight, *cuda)
     bn, g, warps, stages, split = geometry or geometry_for(m, n, k)
-    if not 1 <= m <= 16 or k % 128 or weight.shape[1] != k // 128 * 34:
-        raise ValueError("PQ2 small MMQ requires 1 to 16 tokens and a PQ2 matrix")
+    if not 1 <= m <= _MAX_M or k % 128 or weight.shape[1] != k // 128 * 34:
+        raise ValueError("PQ2 small MMQ requires 1 to 64 tokens and a PQ2 matrix")
     if (k // 128) % split or (k // 128 // split) % g:
         raise ValueError("Split and group count must divide K/128")
     x = x.contiguous()
@@ -281,7 +304,8 @@ def pq2_small_mmq(x, weight, geometry=None):
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     target = y if split == 1 else torch.empty((split, m, n), dtype=torch.float32, device=x.device)
     _small_mmq_masked[(triton.cdiv(n, bn), split)](
-        q, s, t, codes, scales, target, m, n, k, bn, g, stages, split, num_warps=warps
+        q, s, t, codes, scales, target, m, n, k, bn, g, stages, split, _token_tile(m),
+        num_warps=warps,
     )
     if split > 1:
         _reduce_splits[(triton.cdiv(m * n, 1024),)](target, y, m * n, split, 1024)
