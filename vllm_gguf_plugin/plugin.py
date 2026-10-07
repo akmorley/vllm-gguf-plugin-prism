@@ -178,6 +178,10 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_VERSION"] = lambda: (
         attention._SINGLE_ATTN_VERSION
     )
+    envs.environment_variables["GGUF_PQ2_VERIFY_ATTN"] = lambda: attention._VERIFY_ATTN
+    envs.environment_variables["GGUF_PQ2_VERIFY_ATTN_VERSION"] = lambda: (
+        attention._VERIFY_ATTN_VERSION
+    )
 
     # Record resolved import-time choices, including defaults, in AOT cache keys.
     envs.environment_variables["GGUF_PQ2_INT_GEMV"] = lambda: (
