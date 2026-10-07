@@ -134,3 +134,29 @@ The experimental attention split override is not enabled by this promotion.
 
 Full-model measurements with 4096 input and 2048 generated tokens showed
 18.22% and 17.62% higher generation throughput on the two RTX 3090 Ti GPUs.
+
+## Optional single-request Triton attention
+
+To keep FlashAttention 2 for prefill and use Triton for the measured
+single-request decode shape, set these variables before starting the server:
+
+```bash
+GGUF_PQ2_SINGLE_ATTN_BACKEND=triton \
+GGUF_PQ2_SINGLE_ATTN_SEGMENTS=32 \
+vllm serve MODEL.gguf --attention-backend FLASH_ATTN [other options]
+```
+
+The option is disabled by default (`GGUF_PQ2_SINGLE_ATTN_BACKEND=fa2`).
+It supports BF16 queries with 24 query heads, four KV heads and head dimension
+256 on SM86. Prefill, batched decode, other GPUs/shapes/dtypes, sliding-window
+attention, softcaps, auxiliary features and context parallelism retain FA2.
+The existing paged KV layout is preserved, including 784-token hybrid pages.
+Softmax scratch is allocated per call and retained by CUDA graph capture. The resolved backend, segment
+count and implementation version enter vLLM's compilation cache identity.
+Restart the server when changing settings.
+
+A 64-segment option is also available; 32 is the tested starting point.
+Keep the `FLASH_ATTN` vLLM backend selected: this setting changes only eligible
+FA2 calls and does not replace other configured attention backends. This is an
+experimental option: numerical and graph checks passed, but greedy generated
+text can change. Language-quality evaluation is required before promotion.

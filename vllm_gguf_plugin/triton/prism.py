@@ -16,6 +16,9 @@ _EXPERIMENTAL_INT_OUTPUT = os.environ.get("GGUF_PQ2_INT_OUTPUT", "1") == "1"
 _EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
 _MMQ_ACTIVATION_GROUP = int(os.environ.get("GGUF_PQ2_MMQ_GROUP", "128"))
 _BATCH8_FLOAT_OUTPUT_BM = int(os.environ.get("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM", "8"))
+# Bit-exact: smaller floating row tiles for (5120, 6144) at M = 5..16 (8 rows up to M = 8,
+# 16 rows above), instead of padding to 64. Extends the batch-eight rule to verification sizes.
+_SMALL_FLOAT_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_FLOAT_OUTPUT", "1") == "1"
 if _BATCH8_FLOAT_OUTPUT_BM not in (8, 16, 32, 64):
     raise ValueError("GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM must be 8, 16, 32 or 64")
 if _MMQ_ACTIVATION_GROUP not in (32, 64, 128):
@@ -163,6 +166,11 @@ def pq2_matmul(x, weight, *, prepared=False):
         validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if prepared:
+        from . import pq2_small_mmq
+
+        if pq2_small_mmq.eligible(x, weight, prepared):
+            return pq2_small_mmq.pq2_small_mmq(x, weight)
     if _use_int_gemv(x, n, k):
         from .pq2_int_gemv import pq2_int_gemv
 
@@ -198,12 +206,18 @@ def pq2_matmul(x, weight, *, prepared=False):
             x, weight, y, n, k, weight.stride(0), triton.next_power_of_2(k), prepared
         )
     elif m and n:
-        bm = _BATCH8_FLOAT_OUTPUT_BM if (
-            m == 8 and (n, k) == (5120, 6144)
+        small_output = (
+            (n, k) == (5120, 6144)
             and x.dtype in (torch.bfloat16, torch.float16)
             and x.is_cuda
             and torch.cuda.get_device_capability(x.device) == (8, 6)
-        ) else 64
+        )
+        if small_output and m == 8:
+            bm = _BATCH8_FLOAT_OUTPUT_BM
+        elif small_output and _SMALL_FLOAT_OUTPUT and 5 <= m <= 16:
+            bm = 8 if m <= 8 else 16
+        else:
+            bm = 64
         _pq2[(triton.cdiv(m, bm), triton.cdiv(n, 64))](
             x,
             weight,
