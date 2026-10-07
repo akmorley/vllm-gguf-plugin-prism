@@ -1,9 +1,0 @@
-{
-  "token_mismatches": [],
-  "aligned_generated_tokens": 512,
-  "max_generated_logprob_delta": 0.0722566545009613,
-  "mean_generated_logprob_delta": 0.0012883095131357436,
-  "common_top_logprobs": 2554,
-  "max_common_top_logprob_delta": 0.7499961853027344,
-  "note": "Diagnostic fixed workload; no Q8 quality acceptance threshold inferred."
-}
