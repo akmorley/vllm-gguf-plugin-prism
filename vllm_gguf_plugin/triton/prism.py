@@ -201,7 +201,17 @@ def pq2_matmul(x, weight, *, prepared=False):
             x, weight, prepared=prepared, activation_group=_MMQ_ACTIVATION_GROUP
         )
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    if m and n and m <= 4 and k <= 32768:
+    # With the small-batch opt-in, M = 2..4 floating output projections use the 8-row tile
+    # instead of the per-token GEMV (which re-reads the weights for every token). Floating
+    # reduction order changes (~1e-4 relative); not bit-exact with the GEMV.
+    from . import pq2_small_mmq
+
+    tile_output = (
+        pq2_small_mmq._SMALL_MMQ and 2 <= m <= 4 and (n, k) == (5120, 6144)
+        and x.dtype in (torch.bfloat16, torch.float16) and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    )
+    if m and n and m <= 4 and k <= 32768 and not tile_output:
         _pq2_gemv[(n, m)](
             x, weight, y, n, k, weight.stride(0), triton.next_power_of_2(k), prepared
         )
@@ -216,6 +226,8 @@ def pq2_matmul(x, weight, *, prepared=False):
             bm = _BATCH8_FLOAT_OUTPUT_BM
         elif small_output and _SMALL_FLOAT_OUTPUT and 5 <= m <= 16:
             bm = 8 if m <= 8 else 16
+        elif tile_output:
+            bm = 8
         else:
             bm = 64
         _pq2[(triton.cdiv(m, bm), triton.cdiv(n, 64))](

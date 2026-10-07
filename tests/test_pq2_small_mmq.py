@@ -6,7 +6,7 @@ from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
 
 pytestmark=pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(8,6),
                               reason='SM86 CUDA required')
-CASES=sorted((m,n,k) for m,table in small.GEOMETRY_BY_M.items() for n,k in table)
+CASES=sorted({(m,n,k) for tables in (small.GEOMETRY_BY_M,small.CUDA_BY_M) for m,table in tables.items() for n,k in table})
 _WEIGHTS={}
 
 
@@ -76,7 +76,7 @@ def test_dispatch_scope(monkeypatch):
     for m in (1,4,8,16):run(m)
     assert calls==[8]                              # narrow switch: M = 8 only
     calls.clear();monkeypatch.setattr(small,'_BATCH8_SMALL_MMQ',False);monkeypatch.setattr(small,'_SMALL_MMQ',True)
-    expected=[m for m in range(1,18) if small.geometry_for(m,*m8) is not None and 2<=m<=16]
+    expected=[m for m in range(1,18) if 2<=m<=16 and (small.geometry_for(m,*m8) is not None or small.cuda_for(m,*m8) is not None)]
     for m in range(1,18):run(m)
     assert calls==expected and 1 not in calls and 17 not in calls
     calls.clear();run(8,dtype=torch.float32);assert calls==[]  # floating-point activations excluded
@@ -105,3 +105,17 @@ def test_small_float_output_tile_is_bit_exact(monkeypatch,m):
     from vllm_gguf_plugin.plugin import _register_pq2_compile_factors
     _register_pq2_compile_factors()
     assert envs.environment_variables['GGUF_PQ2_SMALL_FLOAT_OUTPUT']() is True
+
+
+@pytest.mark.parametrize('m,n,k',[(m,n,k) for m,t in small.CUDA_BY_M.items() for n,k in t][:6] or [pytest.param(4,16384,5120,marks=pytest.mark.skip('no CUDA table'))])
+def test_cuda_kernel_matches_triton_and_falls_back(enabled,monkeypatch,m,n,k):
+    assert small._cuda_available()
+    w=_weight(n,k);x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+    cuda=prism.pq2_matmul(x,w,prepared=True)
+    triton_out=small.pq2_small_mmq(x,w,small.geometry_for(m,n,k) or (64,2,4,3,1))
+    assert _rel_rms(cuda,triton_out)<2e-4
+    monkeypatch.setattr(small,'_cuda_available',lambda:False)
+    if small.geometry_for(m,n,k) is None:
+        assert not small.eligible(x,w,True)       # falls back to the production path
+    else:
+        torch.testing.assert_close(prism.pq2_matmul(x,w,prepared=True),triton_out,atol=0,rtol=0)

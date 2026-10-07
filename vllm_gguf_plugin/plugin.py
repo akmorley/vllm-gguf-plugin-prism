@@ -213,6 +213,9 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ"] = lambda: (
         pq2_small_mmq._SMALL_MMQ
     )
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
+        pq2_small_mmq._SMALL_MMQ_OUTPUT
+    )
     envs.environment_variables["GGUF_PQ2_BATCH8_SMALL_MMQ"] = lambda: (
         pq2_small_mmq._BATCH8_SMALL_MMQ
     )
