@@ -142,6 +142,33 @@ The experimental attention split override is not enabled by this promotion.
 Full-model measurements with 4096 input and 2048 generated tokens showed
 18.22% and 17.62% higher generation throughput on the two RTX 3090 Ti GPUs.
 
+## Small batches and speculative decoding (defaults)
+
+Within the integer-decode path (`GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`,
+SM86), these are on by default:
+
+| Switch | Effect | Disable |
+|---|---|---|
+| `GGUF_PQ2_SMALL_MMQ` | INT8 tensor-core projections for M = 2..64 (direct-fragment CUDA kernel for M <= 8, Triton with 16/32/64-row token tiles above); also tiles the M = 2..4 floating output projection | `=0` |
+| `GGUF_PQ2_SMALL_MMQ_OUTPUT` | the 5120x6144 output projection at M = 2..8 through the INT8 kernel (as at M = 1); ~0.7% relative change on those outputs | `=0` |
+| `GGUF_PQ2_VERIFY_ATTN` | split-KV attention for 2..16-token queries of one request (speculative verification), exact prefix/tail decomposition | `=0` |
+
+DFlash2 speculative decoding is a server option. On RTX 3090/3090 Ti cards the
+measured best is five draft tokens with an FP8 draft:
+
+```bash
+GGUF_PQ2_INT_GEMV=1 GGUF_PQ2_PREPARED=1 GGUF_PQ2_MMQ=1 \
+vllm serve Ternary-Bonsai-2-27B-PQ2_0.gguf --tokenizer <qwen3.8 tokenizer> \
+  --speculative-config '{"method": "dflash", "model": "<bonsai-dflash2 BF16 dir>", "num_speculative_tokens": 5, "quantization": "fp8"}'
+```
+
+The FP8 draft needs a vLLM build with quantized DFlash context-K/V support
+(`vllm-prism` branch `dflash-quantized-context-kv`); without it, omit
+`"quantization"` (BF16 draft, about 10% slower). Measured on one RTX 3090 Ti:
+about 2.0-2.3x plain decoding for one request from 4K to 32K context, 1.8x at
+two concurrent requests and 1.4x at four. At eight concurrent requests plain
+decoding is faster, so do not enable speculation for heavily batched serving.
+
 ## Optional single-request Triton attention
 
 To keep FlashAttention 2 for prefill and use Triton for the measured

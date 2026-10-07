@@ -124,3 +124,20 @@ def test_wide_buckets_match_mmq(enabled,m):
     w=_weight(n,k);x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
     assert small.geometry_for(m,n,k)==small.GEOMETRY_BY_M[32 if m<=32 else 64][(n,k)]
     assert _rel_rms(prism.pq2_matmul(x,w,prepared=True),pq2_mmq(x,w,prepared=True))<2e-4
+
+
+def test_defaults_in_fresh_process():
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env=dict(os.environ)
+    keys=('GGUF_PQ2_SMALL_MMQ','GGUF_PQ2_SMALL_MMQ_OUTPUT','GGUF_PQ2_VERIFY_ATTN')
+    for key in keys:env.pop(key,None)
+    code=('from vllm_gguf_plugin.triton import pq2_small_mmq as s; from vllm_gguf_plugin import attention as a; '
+          'import json; print(json.dumps([s._SMALL_MMQ,s._SMALL_MMQ_OUTPUT,a._VERIFY_ATTN]))')
+    run=lambda:json.loads(subprocess.check_output([sys.executable,'-c',code],env=env,text=True).strip().splitlines()[-1])
+    assert run()==[True,True,True]
+    env.update({key:'0' for key in keys})
+    assert run()==[False,False,False]

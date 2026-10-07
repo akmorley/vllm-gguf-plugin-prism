@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Small-batch (M = 2..16) PQ2 x Q8 projection on INT8 tensor cores (SM86), swapped operands.
+"""Small-batch (M = 2..64) PQ2 x Q8 projection on INT8 tensor cores (SM86), swapped operands.
 
 Weights are the MMA A operand (BN rows x 32 bytes per 2-bit plane); activations are the
-B operand (32 x 16 tokens, padded). Activations use the production group-128 Q8 arithmetic
+B operand (32 x 16/32/64 tokens, padded). Activations use the production group-128 Q8 arithmetic
 but are stored in plane order (k = byte * 4 + s -> s * 32 + byte), so each plane of a packed
 byte multiplies a contiguous slice. Plane s is `byte & (3 << 2s)` = code * 4^s; the exact
 INT32 product is shifted back, and the ternary -1 offset is applied once per group as -sum(q).
 INT32 group sums equal the DP4A kernel's; only FP32 accumulation order differs.
-Serving use is opt-in: GGUF_PQ2_SMALL_MMQ=1 (M = 2..16).
+On by default within the integer-decode path (prepared weights, SM86); set
+GGUF_PQ2_SMALL_MMQ=0 to disable.
 """
 import os
 
@@ -15,12 +16,13 @@ import torch
 import triton
 import triton.language as tl
 
-# GGUF_PQ2_SMALL_MMQ=1 enables M = 2..16 (speculative verification, small batches).
-_SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "0") == "1"
-# Opt-in: also route the (5120, 6144) output projections (M = 2..8) through the INT8 CUDA kernel.
+# M = 2..64 (speculative verification, small batches). Default on; GGUF_PQ2_SMALL_MMQ=0 disables.
+_SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "1") == "1"
+# Also route the (5120, 6144) output projections (M = 2..8) through the INT8 CUDA kernel.
 # This is the Q8 treatment production already applies at M = 1 (GGUF_PQ2_INT_OUTPUT), but it
-# changes the floating M >= 2 outputs by ~0.7% relative RMS.
-_SMALL_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_MMQ_OUTPUT", "0") == "1"
+# changes the floating M >= 2 outputs by ~0.7% relative RMS. Default on (paired GSM8K/GPQA showed
+# no difference: pq2-dflash-quality-20261007); GGUF_PQ2_SMALL_MMQ_OUTPUT=0 disables.
+_SMALL_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_MMQ_OUTPUT", "1") == "1"
 OUTPUT_CUDA = (2, 8)  # (warps, groups in flight), RTX 3090 Ti microbenchmark, M = 2..8
 _VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v1"
 _MAX_M = 64

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in attention overrides for the tested SM86 shape (24 query heads, 4 KV heads, dim 256).
+"""Attention overrides for the tested SM86 shape (24 query heads, 4 KV heads, dim 256).
 
-- GGUF_PQ2_SINGLE_ATTN_BACKEND=triton: FA2 prefill, Triton segmented single-token decode.
-- GGUF_PQ2_VERIFY_ATTN=1: split-KV attention for short multi-token queries of one request
+- GGUF_PQ2_SINGLE_ATTN_BACKEND=triton (opt-in): FA2 prefill, Triton segmented single-token decode.
+- GGUF_PQ2_VERIFY_ATTN (default on; =0 disables): split-KV attention for short multi-token queries of one request
   (speculative verification). FA2 varlen refuses split-KV for paged KV when seqlen_q > 1, so a
   causal query of n <= 16 tokens is decomposed exactly: the shared prefix (all but the last n
   keys) runs as FA2's single-token split-KV path with the n tokens packed into the head
@@ -19,7 +19,7 @@ import torch
 _SINGLE_ATTN_BACKEND = os.environ.get("GGUF_PQ2_SINGLE_ATTN_BACKEND", "fa2")
 _SINGLE_ATTN_SEGMENTS = int(os.environ.get("GGUF_PQ2_SINGLE_ATTN_SEGMENTS", "32"))
 _SINGLE_ATTN_VERSION = "fa2-prefill-triton-single-decode-v1"
-_VERIFY_ATTN = os.environ.get("GGUF_PQ2_VERIFY_ATTN", "0") == "1"
+_VERIFY_ATTN = os.environ.get("GGUF_PQ2_VERIFY_ATTN", "1") == "1"
 _VERIFY_ATTN_VERSION = "fa2-split-prefix-direct-tail-v1"
 _VERIFY_MAX_Q = 16
 _VERIFY_CALLS = 0  # Python-side calls (warmup and graph capture); replay does not re-enter.
@@ -214,7 +214,7 @@ def _make_single_decode_dispatch(original, segments):
 
 
 def install_single_decode_attention():
-    """Install the enabled overrides once; leave the default backend untouched otherwise."""
+    """Install the enabled overrides once; unmatched calls fall through to FA2 unchanged."""
     if _SINGLE_ATTN_BACKEND != "triton" and not _VERIFY_ATTN:
         return
     import vllm.v1.attention.backends.flash_attn as backend

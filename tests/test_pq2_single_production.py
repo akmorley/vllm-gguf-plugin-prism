@@ -216,14 +216,24 @@ def test_single_attention_scratch_is_not_shared_by_calls(monkeypatch):
         assert all(row[0][0] is args["q"] for row in launches)
 
 
-def test_single_attention_install_is_opt_in_and_idempotent(monkeypatch):
+def test_attention_install_defaults_and_idempotence(monkeypatch):
     from vllm_gguf_plugin import attention
     import vllm.v1.attention.backends.flash_attn as backend
 
     original = backend.flash_attn_varlen_func
+    while hasattr(original, "__wrapped__"):  # start from vLLM's own function
+        original = original.__wrapped__
+    monkeypatch.setattr(backend, "flash_attn_varlen_func", original)
     monkeypatch.setattr(attention, "_SINGLE_ATTN_BACKEND", "fa2")
+    monkeypatch.setattr(attention, "_VERIFY_ATTN", False)
     attention.install_single_decode_attention()
     assert backend.flash_attn_varlen_func is original
+    # Verification attention (default on) installs one fall-through wrapper, idempotently.
+    monkeypatch.setattr(attention, "_VERIFY_ATTN", True)
+    attention.install_single_decode_attention()
+    verify = backend.flash_attn_varlen_func
+    attention.install_single_decode_attention()
+    assert backend.flash_attn_varlen_func is verify and verify._gguf_verify_attention
     monkeypatch.setattr(attention, "_SINGLE_ATTN_BACKEND", "triton")
     monkeypatch.setattr(attention, "_SINGLE_ATTN_SEGMENTS", 32)
     monkeypatch.setattr(backend, "flash_attn_varlen_func", original)
@@ -232,6 +242,7 @@ def test_single_attention_install_is_opt_in_and_idempotent(monkeypatch):
     attention.install_single_decode_attention()
     assert backend.flash_attn_varlen_func is installed
     assert installed._gguf_single_attention_segments == 32
+    assert installed._gguf_verify_attention  # both overrides compose
 
 
 def test_single_attention_changes_compilation_identity(monkeypatch):
