@@ -8,6 +8,10 @@
   keys) runs as FA2's single-token split-KV path with the n tokens packed into the head
   dimension; the last n keys are attended directly with the causal mask; the two partial
   results are merged by their log-sum-exp.
+- GGUF_PQ2_INT8_KV_ATTN (default on; =0 disables): with --kv-cache-dtype int8_per_token_head
+  (Triton backend), decode and speculative verification (<= 16 query tokens per request) run the
+  split-KV INT8 kernel in triton/int8_kv_attention.py instead of vLLM's unified_attention.
+  GGUF_PQ2_INT8_KV_INT_QK=1 quantises Q to int8 for Q.K (llama.cpp style; faster, less exact).
 """
 
 import inspect
@@ -23,6 +27,11 @@ _VERIFY_ATTN = os.environ.get("GGUF_PQ2_VERIFY_ATTN", "1") == "1"
 _VERIFY_ATTN_VERSION = "fa2-split-prefix-direct-tail-v1"
 _VERIFY_MAX_Q = 16
 _VERIFY_CALLS = 0  # Python-side calls (warmup and graph capture); replay does not re-enter.
+_INT8_KV_ATTN = os.environ.get("GGUF_PQ2_INT8_KV_ATTN", "1") == "1"
+_INT8_KV_INT_QK = os.environ.get("GGUF_PQ2_INT8_KV_INT_QK", "0") == "1"
+_INT8_KV_SEGMENTS = int(os.environ.get("GGUF_PQ2_INT8_KV_SEGMENTS", "0"))  # 0: per geometry
+_INT8_KV_VERSION = "split-kv-int8-v2-geometry"
+_INT8_KV_CALLS = 0
 if _SINGLE_ATTN_BACKEND not in ("fa2", "triton"):
     raise ValueError("GGUF_PQ2_SINGLE_ATTN_BACKEND must be fa2 or triton")
 if _SINGLE_ATTN_SEGMENTS not in (32, 64):
@@ -213,8 +222,83 @@ def _make_single_decode_dispatch(original, segments):
     return dispatch
 
 
+def _supports_int8_kv(a):
+    from vllm.v1.kv_cache_interface import KVQuantMode
+
+    q, k = a["q"], a["k"]
+    if a["kv_quant_mode"] != KVQuantMode.INT8_PER_TOKEN_HEAD:
+        return False
+    if not (q.is_cuda and q.ndim == 3 and q.dtype in (torch.bfloat16, torch.float16)):
+        return False
+    heads, dim = q.shape[1], q.shape[2]
+    kv_heads = k.shape[2] if k.ndim == 4 else 0
+    if not (
+        k.dtype == torch.int8
+        and k.stride(-1) == 1
+        and dim in (64, 128, 256)
+        and kv_heads
+        and heads % kv_heads == 0
+        and k.shape[-1] >= dim
+        and isinstance(a["max_seqlen_q"], int)
+        and 1 <= a["max_seqlen_q"] <= 16
+        and a["max_seqlen_q"] * heads // kv_heads <= 128
+        and a["causal"] is True
+        and a["window_size"] in (None, [-1, -1], (-1, -1))
+        and not a["softcap"]
+        and a["alibi_slopes"] is None
+        and a["sinks"] is None
+        and a["output_scale"] is None
+        and a["q_descale"] is None
+        and a["qq_bias"] is None
+        and a["mm_prefix_range"] is None
+        and a["rswa_prefix_lens"] is None
+        and (a["chunk_lookback"] is None or a["chunk_lookback"] < 0)
+        and not a["use_td"]
+        and a["k_scale_cache"] is not None
+        and a["v_scale_cache"] is not None
+        and a["block_table"].shape[0] == a["cu_seqlens_q"].numel() - 1
+    ):
+        return False
+    return torch.cuda.get_device_capability(q.device) >= (8, 0)
+
+
+def _make_int8_kv_dispatch(original):
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def dispatch(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        a = bound.arguments
+        if not _supports_int8_kv(a):
+            return original(*args, **kwargs)
+        from .triton.int8_kv_attention import int8_kv_attention
+
+        global _INT8_KV_CALLS
+        _INT8_KV_CALLS += 1
+        return int8_kv_attention(
+            a["q"], a["k"], a["v"], a["k_scale_cache"], a["v_scale_cache"], a["block_table"],
+            a["cu_seqlens_q"], a["seqused_k"], a["max_seqlen_q"], a["softmax_scale"], a["out"],
+            segments=_INT8_KV_SEGMENTS or None, int_qk=_INT8_KV_INT_QK,
+        )
+
+    dispatch._gguf_int8_kv_attention = True
+    return dispatch
+
+
+def install_int8_kv_attention():
+    """Route eligible INT8-KV calls of the Triton backend to the split-KV kernel."""
+    if not _INT8_KV_ATTN:
+        return
+    import vllm.v1.attention.backends.triton_attn as backend
+
+    if not getattr(backend.unified_attention, "_gguf_int8_kv_attention", False):
+        backend.unified_attention = _make_int8_kv_dispatch(backend.unified_attention)
+
+
 def install_single_decode_attention():
-    """Install the enabled overrides once; unmatched calls fall through to FA2 unchanged."""
+    """Install the enabled overrides once; unmatched calls fall through unchanged."""
+    install_int8_kv_attention()
     if _SINGLE_ATTN_BACKEND != "triton" and not _VERIFY_ATTN:
         return
     import vllm.v1.attention.backends.flash_attn as backend
