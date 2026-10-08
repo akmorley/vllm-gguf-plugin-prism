@@ -208,10 +208,14 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         has_vision = getattr(patched, "vision_config", None) is not None
 
         if has_vision and files.mm_proj is None:
-            raise RuntimeError(
-                "Could not find mm_proj for multimodal Qwen3.5/3.6 GGUF. "
-                "Place *mmproj*.gguf beside the backbone or pass "
-                "model_loader_extra_config={'mm_proj': ...}."
+            # Without a vision projector the model can only run text-only. Keep the
+            # multimodal config (the model class requires vision_config) and map the
+            # backbone under the multimodal layout; with --language-model-only vLLM does
+            # not build the vision tower, so no vision weights are needed.
+            logger.warning(
+                "No *mmproj*.gguf beside the Qwen3.5/3.6 GGUF backbone; it can only "
+                "run text-only (--language-model-only). Place one beside the backbone "
+                "or pass model_loader_extra_config={'mm_proj': ...} for image input."
             )
 
         if files.mm_proj is not None and not has_vision:
@@ -231,7 +235,11 @@ class Qwen35GGUFAdapter(BaseGGUFWeightsAdapter):
         model_config: ModelConfig,
     ) -> dict[str, str]:
         config = model_config.hf_config
-        is_multimodal = files.mm_proj is not None
+        # Multimodal layout whenever the config is multimodal, even without an mmproj
+        # file (text-only serving of a multimodal checkpoint).
+        is_multimodal = files.mm_proj is not None or (
+            getattr(config, "vision_config", None) is not None
+        )
         is_moe = config.model_type in QWEN35_MOE_MODEL_TYPES
         text_mapper = build_qwen35_text_mapper(is_multimodal, is_moe)
         vision_mapper = build_qwen35_vision_mapper()

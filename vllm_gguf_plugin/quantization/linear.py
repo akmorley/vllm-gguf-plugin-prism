@@ -38,6 +38,24 @@ from .utils import (
 )
 
 _EXPERIMENTAL_PREPARED_PQ2 = os.environ.get("GGUF_PQ2_PREPARED", "0") == "1"
+_DEQUANT_GEMM_MIN_BATCH = int(os.environ.get("GGUF_DEQUANT_GEMM_MIN_BATCH", "32"))
+_DEQUANT_GEMM_CHUNK_ELEMS = 64 * 1024 * 1024
+
+
+def _dequant_gemm(
+    x: torch.Tensor, weight: torch.Tensor, weight_type: int
+) -> torch.Tensor:
+    block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+    rows, cols = weight.shape[0], weight.shape[1] // type_size * block_size
+    chunk = max(1, _DEQUANT_GEMM_CHUNK_ELEMS // cols)
+    if rows <= chunk:
+        return x @ ops.ggml_dequantize(weight, weight_type, rows, cols, x.dtype).T
+    y = torch.empty(x.shape[0], rows, dtype=x.dtype, device=x.device)
+    for start in range(0, rows, chunk):
+        part = weight[start : start + chunk]
+        w = ops.ggml_dequantize(part, weight_type, part.shape[0], cols, x.dtype)
+        y[:, start : start + part.shape[0]] = x @ w.T
+    return y
 
 def debug_plain_rmsnorm(
     x: torch.Tensor,
@@ -74,6 +92,11 @@ def _fused_mul_mat_gguf(
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
+    elif x.shape[0] >= _DEQUANT_GEMM_MIN_BATCH and weight_type in DEQUANT_TYPES:
+        # The MMQ kernels use dp4a, not tensor cores: from about 32 rows (3090 Ti, Q5_K/Q6_K)
+        # dequantising to the activation dtype for a cuBLAS GEMM is faster (9-13x at 2048
+        # rows) and exact. Large weights go in row chunks to bound the temporary.
+        y = _dequant_gemm(x, weight, weight_type)
     elif weight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in DEQUANT_TYPES:

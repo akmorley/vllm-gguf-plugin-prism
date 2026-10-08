@@ -354,6 +354,12 @@ def _materialize_gguf_weight_parameter(
     raw_param = getattr(layer, param_name)
     if isinstance(raw_param, GGUFWeightParameter):
         return
+    # Tied modules (e.g. a head tied to embed_tokens) share the raw parameter;
+    # the first one to materialize hands its result to the others.
+    materialized = getattr(raw_param, "gguf_materialized", None)
+    if materialized is not None:
+        layer.register_parameter(param_name, materialized)
+        return
 
     if fallback_weight_loader is None:
         fallback_weight_loader = getattr(raw_param, "weight_loader", None)
@@ -382,6 +388,7 @@ def _materialize_gguf_weight_parameter(
     raw_param.data_container.clear()
     raw_param.shard_id.clear()
     raw_param.shard_id_map.clear()
+    raw_param.gguf_materialized = weight
     layer.register_parameter(param_name, weight)
 
 
@@ -392,6 +399,10 @@ def _materialize_gguf_weight_type_parameter(
 ) -> None:
     raw_param = getattr(layer, param_name)
     if isinstance(raw_param, GGUFWeightTypeParameter):
+        return
+    materialized = getattr(raw_param, "gguf_materialized", None)
+    if materialized is not None:
+        layer.register_parameter(param_name, materialized)
         return
 
     if fallback_weight_loader is None:
@@ -409,6 +420,7 @@ def _materialize_gguf_weight_type_parameter(
     weight_type.shard_weight_type = dict(raw_param.shard_weight_type)
     if hasattr(raw_param, "ignore_warning"):
         weight_type.ignore_warning = raw_param.ignore_warning
+    raw_param.gguf_materialized = weight_type
     layer.register_parameter(param_name, weight_type)
 
 
