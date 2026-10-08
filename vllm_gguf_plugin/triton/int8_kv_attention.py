@@ -29,7 +29,7 @@ def _int8_kv_segment(
     k_ptr, kb, ks, kh,
     ksc_ptr, vsc_ptr, sb, ss, sh,
     table_ptr, st0,
-    cu_ptr, used_ptr,
+    start_ptr, end_ptr, row_ptr, used_ptr,
     acc_ptr, max_ptr, sum_ptr,
     sm_scale,
     GROUP: tl.constexpr, HEADS: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr,
@@ -39,8 +39,10 @@ def _int8_kv_segment(
     seq = tl.program_id(0)
     kv_head = tl.program_id(1)
     segment = tl.program_id(2)
-    q_start = tl.load(cu_ptr + seq)
-    q_len = tl.load(cu_ptr + seq + 1) - q_start
+    # Request `seq` owns query tokens [start, end) of q/out and compact scratch rows from `row`.
+    q_start = tl.load(start_ptr + seq)
+    q_len = tl.load(end_ptr + seq) - q_start
+    first_row = tl.load(row_ptr + seq)
     seq_len = tl.load(used_ptr + seq)
 
     rows = tl.arange(0, ROWS)
@@ -96,7 +98,7 @@ def _int8_kv_segment(
         acc = acc * alpha[:, None] + tl.dot(pv, v.to(tl.bfloat16))
         m = m_new
 
-    out_row = ((q_start + token).to(tl.int64) * HEADS + head) * SEGMENTS + segment
+    out_row = ((first_row + token).to(tl.int64) * HEADS + head) * SEGMENTS + segment
     tl.store(max_ptr + out_row, m, mask=row_ok)
     tl.store(sum_ptr + out_row, l, mask=row_ok)
     tl.store(acc_ptr + out_row[:, None] * D + dims[None, :], acc, mask=row_ok[:, None])
@@ -104,12 +106,13 @@ def _int8_kv_segment(
 
 @triton.jit
 def _int8_kv_reduce(
-    acc_ptr, max_ptr, sum_ptr, out_ptr, so0, so1,
-    HEADS: tl.constexpr, D: tl.constexpr, SEGMENTS: tl.constexpr,
+    acc_ptr, max_ptr, sum_ptr, out_ptr, so0, so1, map_ptr,
+    HEADS: tl.constexpr, D: tl.constexpr, SEGMENTS: tl.constexpr, HAS_MAP: tl.constexpr,
 ):
-    token = tl.program_id(0)
+    compact = tl.program_id(0)
     head = tl.program_id(1)
-    row = (token.to(tl.int64) * HEADS + head) * SEGMENTS
+    row = (compact.to(tl.int64) * HEADS + head) * SEGMENTS
+    token = tl.load(map_ptr + compact) if HAS_MAP else compact
     segs = tl.arange(0, SEGMENTS)
     m = tl.load(max_ptr + row + segs)
     l = tl.load(sum_ptr + row + segs)
@@ -139,16 +142,26 @@ def int8_kv_attention(q, key_cache, value_cache, k_scale_cache, v_scale_cache, b
     """Causal attention for up to 16 query tokens per request over the INT8 per-token-head cache.
 
     ``key_cache``/``value_cache``: int8 ``[blocks, page, kv_heads, >= D]`` views (vLLM's
-    ``_pth_key_value_caches``); scale caches: fp32 ``[blocks, page, kv_heads]``.
+    ``_pth_key_value_caches``); scale caches: fp32 ``[blocks, page, kv_heads]``. Graph safe: the
+    request layout comes from ``cu_seqlens_q`` on the device.
     """
-    tokens, heads, dim = q.shape
+    starts, ends = cu_seqlens_q[:-1], cu_seqlens_q[1:]
+    return _launch(q, key_cache, value_cache, k_scale_cache, v_scale_cache, block_table,
+                   starts, ends, starts, seqused_k, q.shape[0], None, max_seqlen_q,
+                   softmax_scale, out, segments, int_qk, geometry)
+
+
+def _launch(q, key_cache, value_cache, k_scale_cache, v_scale_cache, block_table, starts, ends,
+            first_rows, seqused_k, rows_total, token_map, max_seqlen_q, softmax_scale, out,
+            segments=None, int_qk=False, geometry=None):
+    heads, dim = q.shape[1], q.shape[2]
     kv_heads = key_cache.shape[2]
     group = heads // kv_heads
-    seqs = cu_seqlens_q.numel() - 1
+    seqs = starts.numel()
     rows, tile, warps, default_segments = geometry or _geometry(max_seqlen_q, group)
     segments = segments or default_segments
-    acc = torch.empty((tokens, heads, segments, dim), device=q.device, dtype=torch.float32)
-    maximum = torch.empty((tokens, heads, segments), device=q.device, dtype=torch.float32)
+    acc = torch.empty((rows_total, heads, segments, dim), device=q.device, dtype=torch.float32)
+    maximum = torch.empty((rows_total, heads, segments), device=q.device, dtype=torch.float32)
     expsum = torch.empty_like(maximum)
     assert key_cache.stride() == value_cache.stride()
     # V is addressed from the K pointer at a constant byte offset so that alignment is provable.
@@ -160,15 +173,16 @@ def int8_kv_attention(q, key_cache, value_cache, k_scale_cache, v_scale_cache, b
         key_cache, key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
         k_scale_cache, v_scale_cache,
         k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
-        block_table, block_table.stride(0), cu_seqlens_q, seqused_k,
+        block_table, block_table.stride(0), starts, ends, first_rows, seqused_k,
         acc, maximum, expsum, softmax_scale,
         GROUP=group, HEADS=heads, D=dim, PAGE=key_cache.shape[1],
         ROWS=rows, TILE=tile, SEGMENTS=segments, INT_QK=int_qk, V_OFFSET=v_offset,
         num_warps=warps,
     )
-    _int8_kv_reduce[(tokens, heads)](
+    _int8_kv_reduce[(rows_total, heads)](
         acc, maximum, expsum, out, out.stride(0), out.stride(1),
-        HEADS=heads, D=dim, SEGMENTS=segments, num_warps=4,
+        token_map if token_map is not None else acc,
+        HEADS=heads, D=dim, SEGMENTS=segments, HAS_MAP=token_map is not None, num_warps=4,
     )
     return out
 
@@ -261,4 +275,39 @@ def int8_kv_prefill_attention(q, key_cache, value_cache, k_scale_cache, v_scale_
         merged = (merged * w1[..., None] + part.float() * w2[..., None]) / (w1 + w2)[..., None]
         lse = top + torch.log(w1 + w2)
     out.copy_(merged)
+    return out
+
+
+def int8_kv_mixed_attention(q, key_cache, value_cache, k_scale_cache, v_scale_cache, block_table,
+                            cu_seqlens_q, seqused_k, softmax_scale, out, range_tokens=32768,
+                            segments=None, int_qk=False):
+    """Batches mixing prefill chunks with decode/verification tokens (not graph safe: reads the
+    request layout on the host). Requests with <= MAX_QUERY tokens run the split-KV kernel
+    together; each prefill chunk runs the dequantised-range FA2 path."""
+    cu = cu_seqlens_q.tolist()
+    lengths = seqused_k.tolist()
+    short, prefill = [], []
+    for s in range(len(cu) - 1):
+        n = cu[s + 1] - cu[s]
+        if 0 < n <= MAX_QUERY:
+            short.append(s)
+        elif n > MAX_QUERY:
+            prefill.append(s)
+    if short:
+        device = q.device
+        starts = [cu[s] for s in short]
+        counts = [cu[s + 1] - cu[s] for s in short]
+        first_rows = [sum(counts[:i]) for i in range(len(short))]
+        token_map = [t for st, c in zip(starts, counts) for t in range(st, st + c)]
+        to = lambda v: torch.tensor(v, device=device, dtype=torch.int32)
+        index = to(short).long()
+        _launch(q, key_cache, value_cache, k_scale_cache, v_scale_cache,
+                block_table.index_select(0, index), to(starts), to([a + c for a, c in zip(starts, counts)]),
+                to(first_rows), seqused_k.index_select(0, index), len(token_map), to(token_map),
+                max(counts), softmax_scale, out, segments, int_qk)
+    for s in prefill:
+        lo, hi = cu[s], cu[s + 1]
+        int8_kv_prefill_attention(q[lo:hi], key_cache, value_cache, k_scale_cache, v_scale_cache,
+                                  block_table[s:s + 1], seqused_k[s:s + 1], lengths[s],
+                                  softmax_scale, out[lo:hi], range_tokens=range_tokens)
     return out

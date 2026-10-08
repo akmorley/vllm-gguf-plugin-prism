@@ -14,7 +14,8 @@
   GGUF_PQ2_INT8_KV_INT_QK=1 quantises Q to int8 for Q.K (llama.cpp style; faster, less exact).
   GGUF_PQ2_INT8_KV_PREFILL (default on): single-request prefill chunks dequantise page-aligned key
   ranges (GGUF_PQ2_INT8_KV_PREFILL_RANGE tokens, default 32768) to BF16 and run FA2, merging by
-  log-sum-exp.
+  log-sum-exp. Batches mixing prefill chunks with decode/verification tokens are split on the
+  host: short requests run the split-KV kernel together, each prefill chunk the FA2 path.
 """
 
 import inspect
@@ -36,8 +37,9 @@ _INT8_KV_SEGMENTS = int(os.environ.get("GGUF_PQ2_INT8_KV_SEGMENTS", "0"))  # 0: 
 _INT8_KV_PREFILL = os.environ.get("GGUF_PQ2_INT8_KV_PREFILL", "1") == "1"
 _INT8_KV_PREFILL_RANGE = int(os.environ.get("GGUF_PQ2_INT8_KV_PREFILL_RANGE", "32768"))
 _INT8_KV_VERSION = "split-kv-int8-v2-geometry"
-_INT8_KV_PREFILL_VERSION = "dequant-ranges-fa2-v1"
+_INT8_KV_PREFILL_VERSION = "dequant-ranges-fa2-mixed-split-v2"
 _INT8_KV_PREFILL_CALLS = 0
+_INT8_KV_MIXED_CALLS = 0
 _INT8_KV_CALLS = 0
 if _SINGLE_ATTN_BACKEND not in ("fa2", "triton"):
     raise ValueError("GGUF_PQ2_SINGLE_ATTN_BACKEND must be fa2 or triton")
@@ -230,21 +232,20 @@ def _make_single_decode_dispatch(original, segments):
 
 
 def _int8_kv_route(a):
-    """'decode' (<= 16 query tokens per request), 'prefill' (one request) or None."""
+    """'decode' (<= 16 query tokens per request; graph safe), 'prefill' (one request), 'mixed'
+    (several requests, at least one prefill chunk; reads the request layout on the host) or None."""
     if not _supports_int8_kv(a):
         return None
-    if a["max_seqlen_q"] <= 16 and a["max_seqlen_q"] * a["q"].shape[1] // a["k"].shape[2] <= 128:
+    group = a["q"].shape[1] // a["k"].shape[2]
+    if a["max_seqlen_q"] <= 16 and a["max_seqlen_q"] * group <= 128:
         return "decode"
-    if (
-        _INT8_KV_PREFILL
-        and a["cu_seqlens_q"].numel() == 2
-        and a["q"].shape[0] == a["max_seqlen_q"]
-        and isinstance(a["max_seqlen_k"], int)
-        and a["k"].shape[1] % 16 == 0
-        and a["q"].shape[2] == 256
-    ):
-        return "prefill"
-    return None
+    if not (_INT8_KV_PREFILL and a["k"].shape[1] % 16 == 0 and a["q"].shape[2] == 256):
+        return None
+    if a["cu_seqlens_q"].numel() == 2:
+        if a["q"].shape[0] == a["max_seqlen_q"] and isinstance(a["max_seqlen_k"], int):
+            return "prefill"
+        return None
+    return "mixed" if 16 * group <= 128 else None
 
 
 def _supports_int8_kv(a):
@@ -297,8 +298,19 @@ def _make_int8_kv_dispatch(original):
         route = _int8_kv_route(a)
         if route is None:
             return original(*args, **kwargs)
-        from .triton.int8_kv_attention import int8_kv_attention, int8_kv_prefill_attention
+        from .triton.int8_kv_attention import (
+            int8_kv_attention, int8_kv_mixed_attention, int8_kv_prefill_attention,
+        )
 
+        if route == "mixed":
+            global _INT8_KV_MIXED_CALLS
+            _INT8_KV_MIXED_CALLS += 1
+            return int8_kv_mixed_attention(
+                a["q"], a["k"], a["v"], a["k_scale_cache"], a["v_scale_cache"],
+                a["block_table"], a["cu_seqlens_q"], a["seqused_k"], a["softmax_scale"], a["out"],
+                range_tokens=_INT8_KV_PREFILL_RANGE, segments=_INT8_KV_SEGMENTS or None,
+                int_qk=_INT8_KV_INT_QK,
+            )
         if route == "prefill":
             global _INT8_KV_PREFILL_CALLS
             _INT8_KV_PREFILL_CALLS += 1

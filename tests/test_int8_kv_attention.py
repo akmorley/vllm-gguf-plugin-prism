@@ -165,6 +165,7 @@ def test_dispatch_routes_eligible_calls_and_falls_through(monkeypatch):
     assert calls == [] and attention._INT8_KV_CALLS == before + 1
     assert _rel(call["out"], _reference(a)) < 1e-2
     # Prefill-sized queries, windows, other KV modes and non-causal calls are not ours.
+    monkeypatch.setattr(attention, "_INT8_KV_PREFILL", False)  # long queries then fall through
     for overrides in ({"max_seqlen_q": 17}, {"window_size": (2047, 0)}, {"causal": False},
                       {"kv_quant_mode": KVQuantMode.FP8_PER_TOKEN_HEAD}, {"softcap": 30.0}):
         dispatch(**_backend_call(a, **overrides))
@@ -237,7 +238,29 @@ def test_dispatch_routes_single_request_prefill():
     dispatch(**call)
     assert calls == [] and attention._INT8_KV_PREFILL_CALLS == before + 1
     assert _rel(call["out"], _reference(a)) < 1e-2
-    # A multi-request batch with a long query falls through to vLLM.
+    # A multi-request batch with a prefill chunk is split (decode kernel + FA2 prefill path).
+    mixed = attention._INT8_KV_MIXED_CALLS
     b = _inputs([9000, 300], [2048, 1], seed=14)
-    dispatch(**_backend_call(b))
-    assert calls == ["original"]
+    call = _backend_call(b)
+    dispatch(**call)
+    assert calls == [] and attention._INT8_KV_MIXED_CALLS == mixed + 1
+    assert _rel(call["out"], _reference(b)) < 1e-2
+
+
+@pytest.mark.parametrize(("used", "rows"), [
+    ([9000, 300], [2048, 1]),                       # prefill chunk + one decode
+    ([40, 20000, 5000, 3000], [1, 6, 1100, 1]),     # decode, verify, prefill, decode
+    ([2048, 7000, 33], [2048, 517, 17]),            # only prefill chunks (incl. 17 tokens)
+    ([12000, 2048, 25000], [6, 2048, 16]),          # verify, first chunk, 16-token verify
+])
+def test_mixed_batches_match_reference(used, rows):
+    from vllm_gguf_plugin.triton.int8_kv_attention import int8_kv_mixed_attention
+    import vllm.vllm_flash_attn  # noqa: F401
+
+    a = _inputs(used, rows, seed=sum(used))
+    out = torch.full_like(a["q"], float("nan"))
+    int8_kv_mixed_attention(a["q"], a["key_cache"], a["value_cache"], a["k_scale_cache"],
+                            a["v_scale_cache"], a["block_table"], a["cu_seqlens_q"],
+                            a["seqused_k"], a["softmax_scale"], out, range_tokens=3104)
+    assert not out.isnan().any()  # every token's rows were written
+    assert _rel(out, _reference(a)) < 1e-2
