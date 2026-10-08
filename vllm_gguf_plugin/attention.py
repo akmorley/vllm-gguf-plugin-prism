@@ -12,6 +12,9 @@
   (Triton backend), decode and speculative verification (<= 16 query tokens per request) run the
   split-KV INT8 kernel in triton/int8_kv_attention.py instead of vLLM's unified_attention.
   GGUF_PQ2_INT8_KV_INT_QK=1 quantises Q to int8 for Q.K (llama.cpp style; faster, less exact).
+  GGUF_PQ2_INT8_KV_PREFILL (default on): single-request prefill chunks dequantise page-aligned key
+  ranges (GGUF_PQ2_INT8_KV_PREFILL_RANGE tokens, default 32768) to BF16 and run FA2, merging by
+  log-sum-exp.
 """
 
 import inspect
@@ -30,7 +33,11 @@ _VERIFY_CALLS = 0  # Python-side calls (warmup and graph capture); replay does n
 _INT8_KV_ATTN = os.environ.get("GGUF_PQ2_INT8_KV_ATTN", "1") == "1"
 _INT8_KV_INT_QK = os.environ.get("GGUF_PQ2_INT8_KV_INT_QK", "0") == "1"
 _INT8_KV_SEGMENTS = int(os.environ.get("GGUF_PQ2_INT8_KV_SEGMENTS", "0"))  # 0: per geometry
+_INT8_KV_PREFILL = os.environ.get("GGUF_PQ2_INT8_KV_PREFILL", "1") == "1"
+_INT8_KV_PREFILL_RANGE = int(os.environ.get("GGUF_PQ2_INT8_KV_PREFILL_RANGE", "32768"))
 _INT8_KV_VERSION = "split-kv-int8-v2-geometry"
+_INT8_KV_PREFILL_VERSION = "dequant-ranges-fa2-v1"
+_INT8_KV_PREFILL_CALLS = 0
 _INT8_KV_CALLS = 0
 if _SINGLE_ATTN_BACKEND not in ("fa2", "triton"):
     raise ValueError("GGUF_PQ2_SINGLE_ATTN_BACKEND must be fa2 or triton")
@@ -222,6 +229,24 @@ def _make_single_decode_dispatch(original, segments):
     return dispatch
 
 
+def _int8_kv_route(a):
+    """'decode' (<= 16 query tokens per request), 'prefill' (one request) or None."""
+    if not _supports_int8_kv(a):
+        return None
+    if a["max_seqlen_q"] <= 16 and a["max_seqlen_q"] * a["q"].shape[1] // a["k"].shape[2] <= 128:
+        return "decode"
+    if (
+        _INT8_KV_PREFILL
+        and a["cu_seqlens_q"].numel() == 2
+        and a["q"].shape[0] == a["max_seqlen_q"]
+        and isinstance(a["max_seqlen_k"], int)
+        and a["k"].shape[1] % 16 == 0
+        and a["q"].shape[2] == 256
+    ):
+        return "prefill"
+    return None
+
+
 def _supports_int8_kv(a):
     from vllm.v1.kv_cache_interface import KVQuantMode
 
@@ -240,8 +265,7 @@ def _supports_int8_kv(a):
         and heads % kv_heads == 0
         and k.shape[-1] >= dim
         and isinstance(a["max_seqlen_q"], int)
-        and 1 <= a["max_seqlen_q"] <= 16
-        and a["max_seqlen_q"] * heads // kv_heads <= 128
+        and a["max_seqlen_q"] >= 1
         and a["causal"] is True
         and a["window_size"] in (None, [-1, -1], (-1, -1))
         and not a["softcap"]
@@ -270,10 +294,19 @@ def _make_int8_kv_dispatch(original):
         bound = signature.bind(*args, **kwargs)
         bound.apply_defaults()
         a = bound.arguments
-        if not _supports_int8_kv(a):
+        route = _int8_kv_route(a)
+        if route is None:
             return original(*args, **kwargs)
-        from .triton.int8_kv_attention import int8_kv_attention
+        from .triton.int8_kv_attention import int8_kv_attention, int8_kv_prefill_attention
 
+        if route == "prefill":
+            global _INT8_KV_PREFILL_CALLS
+            _INT8_KV_PREFILL_CALLS += 1
+            return int8_kv_prefill_attention(
+                a["q"], a["k"], a["v"], a["k_scale_cache"], a["v_scale_cache"],
+                a["block_table"], a["seqused_k"], a["max_seqlen_k"], a["softmax_scale"], a["out"],
+                range_tokens=_INT8_KV_PREFILL_RANGE,
+            )
         global _INT8_KV_CALLS
         _INT8_KV_CALLS += 1
         return int8_kv_attention(

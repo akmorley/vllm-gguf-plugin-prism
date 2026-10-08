@@ -171,3 +171,94 @@ def int8_kv_attention(q, key_cache, value_cache, k_scale_cache, v_scale_cache, b
         HEADS=heads, D=dim, SEGMENTS=segments, num_warps=4,
     )
     return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Prefill: dequantise page-aligned key ranges into a BF16 scratch and run FA2 (llama.cpp converts
+# quantised K/V to F16 before its tensor-core kernel for batch > 1). Ranges are bounded so the
+# scratch stays small at any context length; partial results are merged by log-sum-exp.
+# ---------------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _dequant_pages(
+    k_ptr, kb, ks, kh, ksc_ptr, vsc_ptr, sb, ss, sh,
+    table_ptr, first, key_out, value_out,
+    KV_HEADS: tl.constexpr, D: tl.constexpr, PAGE: tl.constexpr, SLOTS: tl.constexpr,
+    V_OFFSET: tl.constexpr,
+):
+    page = tl.program_id(0)
+    chunk = tl.program_id(1)
+    head = tl.program_id(2)
+    block = tl.load(table_ptr + first + page).to(tl.int64)
+    slot = chunk * SLOTS + tl.arange(0, SLOTS)
+    ok = slot < PAGE
+    dims = tl.arange(0, D)
+    base = tl.multiple_of(block * kb + slot * ks + head * kh, 8)
+    sbase = block * sb + slot * ss + head * sh
+    k = tl.load(k_ptr + base[:, None] + dims[None, :], mask=ok[:, None], other=0).to(tl.float32)
+    v = tl.load(k_ptr + V_OFFSET + base[:, None] + dims[None, :], mask=ok[:, None], other=0)
+    k = k * tl.load(ksc_ptr + sbase, mask=ok, other=0.0)[:, None]
+    v = v.to(tl.float32) * tl.load(vsc_ptr + sbase, mask=ok, other=0.0)[:, None]
+    dst = ((page.to(tl.int64) * PAGE + slot) * KV_HEADS + head)[:, None] * D + dims[None, :]
+    tl.store(key_out + dst, k.to(key_out.dtype.element_ty), mask=ok[:, None])
+    tl.store(value_out + dst, v.to(value_out.dtype.element_ty), mask=ok[:, None])
+
+
+def dequantize_pages(key_cache, value_cache, k_scale_cache, v_scale_cache, table_row, first,
+                     count, dim, dtype):
+    """BF16 ``[count, page, kv_heads, D]`` K and V for logical pages ``first .. first+count-1``."""
+    blocks, page, kv_heads, _ = key_cache.shape
+    keys = torch.empty((count, page, kv_heads, dim), device=key_cache.device, dtype=dtype)
+    values = torch.empty_like(keys)
+    slots = 32
+    _dequant_pages[(count, triton.cdiv(page, slots), kv_heads)](
+        key_cache, key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+        k_scale_cache, v_scale_cache,
+        k_scale_cache.stride(0), k_scale_cache.stride(1), k_scale_cache.stride(2),
+        table_row, first, keys, values,
+        KV_HEADS=kv_heads, D=dim, PAGE=page, SLOTS=slots,
+        V_OFFSET=value_cache.data_ptr() - key_cache.data_ptr(), num_warps=4,
+    )
+    return keys, values
+
+
+def int8_kv_prefill_attention(q, key_cache, value_cache, k_scale_cache, v_scale_cache,
+                              block_table, seqused_k, max_seqlen_k, softmax_scale, out,
+                              range_tokens=32768):
+    """Causal attention for one request's prefill chunk (all of ``q``) over the INT8 cache.
+
+    The chunk's queries are the last ``q.shape[0]`` positions of a sequence of ``max_seqlen_k``
+    keys. Keys before the chunk are processed in page-aligned ranges without a mask; the final
+    range (holding the chunk) uses FA2's bottom-right causal alignment.
+    """
+    n, heads, dim = q.shape
+    length = max_seqlen_k
+    page = key_cache.shape[1]
+    span = max(page, range_tokens // page * page)
+    boundary = (length - n) // page * page  # keys [0, boundary) are visible to every query
+    ranges = [(a, min(a + span, boundary), False) for a in range(0, boundary, span)]
+    ranges.append((boundary, length, True))
+    cu = torch.tensor([0, n], device=q.device, dtype=torch.int32)
+    row = block_table[0]
+    merged = lse = None
+    for start, end, causal in ranges:
+        count = triton.cdiv(end, page) - start // page
+        keys, values = dequantize_pages(key_cache, value_cache, k_scale_cache, v_scale_cache,
+                                        row, start // page, count, dim, q.dtype)
+        table = torch.arange(count, device=q.device, dtype=torch.int32)[None]
+        used = torch.full((1,), end - start, device=q.device, dtype=torch.int32)
+        part, part_lse = torch.ops._vllm_fa2_C.varlen_fwd(
+            q, keys, values, None, cu, torch.zeros_like(cu), used, None, table, None,
+            n, end - start, 0.0, softmax_scale, False, causal, -1, -1, 0.0, False, 0, None,
+        )[:2]
+        part_lse = part_lse.t()  # [n, heads]
+        if merged is None:
+            merged, lse = part.float(), part_lse
+            continue
+        top = torch.maximum(lse, part_lse)
+        w1, w2 = torch.exp(lse - top), torch.exp(part_lse - top)
+        merged = (merged * w1[..., None] + part.float() * w2[..., None]) / (w1 + w2)[..., None]
+        lse = top + torch.log(w1 + w2)
+    out.copy_(merged)
+    return out

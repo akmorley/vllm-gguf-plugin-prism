@@ -198,3 +198,46 @@ def test_compile_factors_registered(monkeypatch):
     monkeypatch.setattr(attention, "_INT8_KV_INT_QK", True)
     assert envs.environment_variables["GGUF_PQ2_INT8_KV_INT_QK"]() is True
     assert envs.environment_variables["GGUF_PQ2_INT8_KV_VERSION"]() == attention._INT8_KV_VERSION
+
+
+@pytest.mark.parametrize(("used", "rows", "range_tokens"), [
+    (2048, 2048, 32768),     # first chunk: no prefix, causal range only
+    (3000, 2048, 32768),     # prefix shorter than a page
+    (20000, 2048, 32768),    # one prefix range
+    (20000, 2048, 3104),     # several prefix ranges (2 pages each)
+    (40000, 517, 1552),      # odd chunk, one page per range
+])
+def test_prefill_matches_reference(used, rows, range_tokens):
+    from vllm_gguf_plugin.triton.int8_kv_attention import int8_kv_prefill_attention
+    import vllm.vllm_flash_attn  # noqa: F401  (registers the FA2 op)
+
+    a = _inputs([used], [rows], seed=used + rows)
+    out = torch.empty_like(a["q"])
+    int8_kv_prefill_attention(a["q"], a["key_cache"], a["value_cache"], a["k_scale_cache"],
+                              a["v_scale_cache"], a["block_table"], a["seqused_k"], used,
+                              a["softmax_scale"], out, range_tokens=range_tokens)
+    assert _rel(out, _reference(a)) < 1e-2
+
+
+def test_dispatch_routes_single_request_prefill():
+    from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+    from vllm_gguf_plugin import attention
+    import vllm.vllm_flash_attn  # noqa: F401
+
+    calls = []
+
+    def original(*args, **kwargs):
+        calls.append("original")
+
+    original.__signature__ = __import__("inspect").signature(unified_attention)
+    dispatch = attention._make_int8_kv_dispatch(original)
+    before = attention._INT8_KV_PREFILL_CALLS
+    a = _inputs([9000], [2048], seed=13)
+    call = _backend_call(a)
+    dispatch(**call)
+    assert calls == [] and attention._INT8_KV_PREFILL_CALLS == before + 1
+    assert _rel(call["out"], _reference(a)) < 1e-2
+    # A multi-request batch with a long query falls through to vLLM.
+    b = _inputs([9000, 300], [2048, 1], seed=14)
+    dispatch(**_backend_call(b))
+    assert calls == ["original"]
