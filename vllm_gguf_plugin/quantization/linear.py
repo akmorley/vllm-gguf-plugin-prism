@@ -281,6 +281,11 @@ class GGUFLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
 
+        # The GGUF kernels take 2-D activations; vision towers pass [seq, batch, hidden].
+        leading = x.shape[:-1]
+        if x.dim() != 2:
+            x = x.reshape(-1, x.shape[-1])
+
         hadamard_runtime = self.hadamard_runtime_config
         skip_input_layout = (
             hadamard_runtime is not None and hadamard_runtime.skip_input_layout
@@ -362,4 +367,6 @@ class GGUFLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
 
+        if len(leading) != 1:
+            out = out.reshape(*leading, out.shape[-1])
         return out
