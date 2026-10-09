@@ -109,7 +109,8 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
   const int64_t padded = (col + 512 - 1) / 512 * 512;
   const int32_t device_idx = X.get_device_index();
   const DeviceGuard device_guard(device_idx);
-  Tensor Y = torch::stable::new_zeros(W, {vecs, row}, X.scalar_type());
+  // Every MMVQ launch writes all vecs x row outputs, so no zero fill is needed.
+  Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   cudaStream_t stream = get_current_cuda_stream(device_idx);
   Tensor quant_X =
       torch::stable::new_empty(W, {vecs, padded / 32 * 9}, ScalarType::Int);

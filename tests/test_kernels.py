@@ -1,6 +1,7 @@
+import numpy as np
 import pytest
 import torch
-from gguf import GGMLQuantizationType, dequantize
+from gguf import GGMLQuantizationType, dequantize, quantize
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -124,15 +125,22 @@ def test_gguf_embedding(
         torch.testing.assert_close(output, ref_output, atol=1e-2, rtol=4e-2)
 
 
+# 1-8 vectors use the multi-vector kernel.
+@pytest.mark.parametrize("num_vecs", [1, 2, 3, 5, 8])
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("quant_type", QUANT_TYPES)
 @torch.inference_mode()
-def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantizationType):
+def test_mmvq(
+    num_vecs: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    quant_type: GGMLQuantizationType,
+):
     seed_everything(0)
 
     tensors = get_gguf_sample_tensors(hidden_size, quant_type)
-    x = torch.rand((1, hidden_size), dtype=dtype, device="cuda")
+    x = torch.rand((num_vecs, hidden_size), dtype=dtype, device="cuda")
     for tensor in tensors:
         weight = torch.tensor(dequantize(tensor.data, quant_type), device="cuda").to(
             dtype
@@ -145,6 +153,26 @@ def test_mmvq(hidden_size: int, dtype: torch.dtype, quant_type: GGMLQuantization
         )
 
         torch.testing.assert_close(output, ref_output, atol=1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("num_vecs", [1, 3, 8])
+@torch.inference_mode()
+def test_mmvq_tall(num_vecs: int):
+    # >= 65536 rows take the 4-rows-per-block launch; an odd row count checks that the
+    # last block never reads past the final row.
+    seed_everything(0)
+    quant_type = GGMLQuantizationType.Q8_0
+    rows, cols = 65537, 256
+    w_float = np.random.default_rng(0).standard_normal((rows, cols), dtype=np.float32)
+    w_q = quantize(w_float, quant_type)
+    ref_weight = torch.tensor(dequantize(w_q, quant_type), device="cuda")
+    x = torch.rand((num_vecs, cols), dtype=torch.float32, device="cuda")
+
+    output = ops.ggml_mul_mat_vec_a8(
+        torch.tensor(w_q, device="cuda"), x, quant_type, rows
+    )
+
+    torch.testing.assert_close(output, x @ ref_weight.T, atol=1, rtol=1e-1)
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)

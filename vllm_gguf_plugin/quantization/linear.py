@@ -73,16 +73,27 @@ def debug_plain_rmsnorm(
 
 
 
+def gguf_shard_weight(weight: torch.Tensor, shard: str) -> torch.Tensor:
+    """Contiguous packed bytes of one shard of a merged GGUF weight."""
+    views = getattr(weight, "gguf_shard_views", None)
+    if views is not None:
+        return views[shard]
+    start, end, size = weight.shard_offset_map[shard]
+    return weight[start:end, :size].contiguous()
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, weight: torch.Tensor, weight_type: int,
     pq2_prepared: bool = False,
 ) -> torch.Tensor:
     if pq2_prepared and (weight_type != WeightType.PQ2_0 or not x.is_cuda):
         raise ValueError("Prepared weights require CUDA PQ2 execution")
+    # MMVQ reads each weight block once for up to 8 vectors (more fall back to a per-vector
+    # kernel); at 8 rows it is still 1.5-2x faster than MMQ on 3090 Ti Q5_K/Q6_K shapes.
     if weight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if weight.shape[0] > 5120 else 16
     else:
-        mmvq_safe = 2 if weight.shape[0] > 5120 else 6
+        mmvq_safe = 8
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type == WeightType.PQ2_0 and x.is_cuda:
@@ -262,18 +273,41 @@ class GGUFLinearMethod(LinearMethodBase):
             dtype = next(iter(dtype))
             padded_side = max(x.size(1) for x in data_container)
             concat_side = sum(x.size(0) for x in data_container)
-            padded_data = torch.zeros(
-                (concat_side, padded_side), dtype=dtype, device=weight.device
-            )
-            shard_offset_map = dict[str, tuple[int, int, int]]()
             ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
+            # Shards of different GGUF types (e.g. Q6_K and Q5_K rows of a GDN in_proj)
+            # have different row widths. Padding them into one [rows, max_width] tensor
+            # makes every narrower shard strided, and apply() would copy it on each
+            # call (7 MB per Qwen3.5-4B GDN layer per token). Store each shard
+            # contiguously in a flat buffer instead and run it through a view.
+            flat = len({x.size(1) for x in data_container}) > 1
+            if flat:
+                padded_data = torch.empty(
+                    sum(x.numel() for x in data_container),
+                    dtype=dtype,
+                    device=weight.device,
+                )
+            else:
+                padded_data = torch.zeros(
+                    (concat_side, padded_side), dtype=dtype, device=weight.device
+                )
+            shard_offset_map = dict[str, tuple[int, int, int]]()
+            shard_views = dict[str, torch.Tensor]()
             current_offset = 0
+            flat_offset = 0
             for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
+                data = data_container[id_in_container]
                 start = current_offset
-                end = start + data_container[id_in_container].size(0)
-                size = data_container[id_in_container].size(1)
-                padded_data[start:end, :size] = data_container[id_in_container]
+                end = start + data.size(0)
+                size = data.size(1)
+                if flat:
+                    view = padded_data[flat_offset : flat_offset + data.numel()]
+                    view = view.view(data.size(0), size)
+                    view.copy_(data)
+                    shard_views[idx] = view
+                    flat_offset += data.numel()
+                else:
+                    padded_data[start:end, :size] = data
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
             padded_param = GGUFWeightParameter(
@@ -289,6 +323,8 @@ class GGUFLinearMethod(LinearMethodBase):
             if hasattr(weight, "ignore_warning"):
                 padded_param.ignore_warning = weight.ignore_warning
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
+            if flat:
+                set_weight_attrs(padded_param, {"gguf_shard_views": shard_views})
             weight.data_container.clear()
             weight.shard_id.clear()
             weight.shard_id_map.clear()
@@ -356,8 +392,6 @@ class GGUFLinearMethod(LinearMethodBase):
                 result = []
 
                 for idx in shard_id:
-                    start, end, offset = layer.weight.shard_offset_map[idx]
-
                     weight_type = (
                         layer.weight_type.shard_weight_type.get(
                             idx,
@@ -367,7 +401,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
                     shard_out = fused_mul_mat_gguf_op(
                         x,
-                        weight[start:end, :offset].contiguous(),
+                        gguf_shard_weight(weight, idx),
                         weight_type,
                     )
 
