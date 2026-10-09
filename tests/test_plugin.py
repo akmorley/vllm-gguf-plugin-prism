@@ -430,3 +430,62 @@ def test_gguf_merged_column_releases_shards_after_concat(monkeypatch):
     assert layer.weight is not source_param
     assert not source_param.data_container
     assert all(ref() is None for ref in shard_refs)
+
+
+def test_gguf_linear_mixed_type_shards_quantize_activation_once(monkeypatch):
+    import vllm_gguf_plugin.quantization.linear as gguf_linear
+
+    register()
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    quant_config = OOTGGUFConfig.from_config({})
+    layer = MergedColumnParallelLinear(
+        input_size=256,
+        output_sizes=[4, 4],
+        bias=False,
+        quant_config=quant_config,
+        disable_tp=True,
+    )
+    # One Q5_K and one Q6_K shard: different row widths (176 vs 210 bytes per 256 values).
+    layer.weight_loader_v2(layer.weight, torch.ones((4, 176), dtype=torch.uint8), 0)
+    layer.weight_loader_v2(layer.weight, 2 * torch.ones((4, 210), dtype=torch.uint8), 1)
+    layer.weight_loader_v2(layer.weight_type, torch.tensor(13, dtype=torch.uint8), 0)
+    layer.weight_loader_v2(layer.weight_type, torch.tensor(14, dtype=torch.uint8), 1)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    quantized, prequantized, plain = [], [], []
+    sentinel = torch.zeros(1, dtype=torch.int32)
+
+    def fake_quantize(x):
+        quantized.append(tuple(x.shape))
+        return sentinel
+
+    def fake_prequantized(x, quant_x, weight, weight_type):
+        assert quant_x is sentinel
+        prequantized.append((tuple(weight.shape), weight_type))
+        return torch.zeros((x.shape[0], weight.shape[0]), dtype=x.dtype)
+
+    def fake_plain(x, weight, weight_type):
+        plain.append((tuple(weight.shape), weight_type))
+        return torch.zeros((x.shape[0], weight.shape[0]), dtype=x.dtype)
+
+    monkeypatch.setattr(gguf_linear.ops, "ggml_quantize_q8_1", fake_quantize)
+    monkeypatch.setattr(gguf_linear, "fused_mul_mat_gguf_prequantized", fake_prequantized)
+    monkeypatch.setattr(gguf_quantization, "fused_mul_mat_gguf", fake_plain)
+
+    # Up to 16 rows (MMVQ): one Q8_1 quantization shared by both shards.
+    out = layer.quant_method.apply(layer, torch.ones((12, 256), dtype=torch.float32))
+    assert out.shape == (12, 8)
+    assert quantized == [(12, 256)]
+    assert prequantized == [((4, 176), 13), ((4, 210), 14)]
+    assert plain == []
+
+    # Above 16 rows each shard takes its own (MMQ / dequant) path.
+    quantized.clear(), prequantized.clear()
+    out = layer.quant_method.apply(layer, torch.ones((17, 256), dtype=torch.float32))
+    assert out.shape == (17, 8)
+    assert quantized == [] and prequantized == []
+    assert plain == [((4, 176), 13), ((4, 210), 14)]

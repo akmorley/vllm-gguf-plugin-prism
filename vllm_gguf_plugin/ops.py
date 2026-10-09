@@ -132,6 +132,29 @@ if (
     ) -> torch.Tensor:
         return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
 
+    if hasattr(torch.ops._C_gguf, "ggml_quantize_q8_1"):
+
+        @register_fake("_C_gguf::ggml_quantize_q8_1")
+        def _ggml_quantize_q8_1_fake(X: torch.Tensor) -> torch.Tensor:
+            padded = ((X.shape[1] + 511) // 512) * 512
+            return torch.empty(
+                (X.shape[0], padded // 32 * 9),
+                dtype=torch.int32,
+                device=X.device,
+            )
+
+    if hasattr(torch.ops._C_gguf, "ggml_mul_mat_vec_a8_prequantized"):
+
+        @register_fake("_C_gguf::ggml_mul_mat_vec_a8_prequantized")
+        def _ggml_mul_mat_vec_a8_prequantized_fake(
+            W: torch.Tensor,
+            X: torch.Tensor,
+            quant_X: torch.Tensor,
+            quant_type: int,
+            row: torch.SymInt,
+        ) -> torch.Tensor:
+            return torch.empty((X.shape[0], row), dtype=X.dtype, device=W.device)
+
     @register_fake("_C_gguf::ggml_mul_mat_a8")
     def _ggml_mul_mat_a8_fake(
         W: torch.Tensor,
@@ -220,6 +243,27 @@ def ggml_mul_mat_vec_a8(
     if _cuda_kernel_available("ggml_mul_mat_vec_a8", quant_type):
         return torch.ops._C_gguf.ggml_mul_mat_vec_a8(W, X, quant_type, row)
     return ggml_mul_mat_a8_triton(W, X, quant_type, row)
+
+
+def ggml_quantize_q8_1(X: torch.Tensor) -> torch.Tensor | None:
+    """Quantize one activation batch for reuse by multiple GGUF GEMVs."""
+    if not X.is_cuda or not _cuda_kernel_available("ggml_quantize_q8_1"):
+        return None
+    return torch.ops._C_gguf.ggml_quantize_q8_1(X)
+
+
+def ggml_mul_mat_vec_a8_prequantized(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    quant_X: torch.Tensor,
+    quant_type: int,
+    row: int,
+) -> torch.Tensor:
+    if _cuda_kernel_available("ggml_mul_mat_vec_a8_prequantized", quant_type):
+        return torch.ops._C_gguf.ggml_mul_mat_vec_a8_prequantized(
+            W, X, quant_X, quant_type, row
+        )
+    return ggml_mul_mat_vec_a8(W, X, quant_type, row)
 
 
 def ggml_mul_mat_a8(

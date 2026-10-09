@@ -265,6 +265,14 @@ static void launch_mul_mat_vec_q(const void * vx, const void * vy, scalar_t * ds
         case 6: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 6>(vx, vy, dst, ncols, nrows, stream); return;
         case 7: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 7>(vx, vy, dst, ncols, nrows, stream); return;
         case 8: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 8>(vx, vy, dst, ncols, nrows, stream); return;
+        case 9: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 9>(vx, vy, dst, ncols, nrows, stream); return;
+        case 10: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 10>(vx, vy, dst, ncols, nrows, stream); return;
+        case 11: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 11>(vx, vy, dst, ncols, nrows, stream); return;
+        case 12: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 12>(vx, vy, dst, ncols, nrows, stream); return;
+        case 13: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 13>(vx, vy, dst, ncols, nrows, stream); return;
+        case 14: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 14>(vx, vy, dst, ncols, nrows, stream); return;
+        case 15: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 15>(vx, vy, dst, ncols, nrows, stream); return;
+        case 16: launch_mul_mat_vec_q_multi<scalar_t, qk, qi, block_q_t, vdr, vec_dot_q_cuda, 16>(vx, vy, dst, ncols, nrows, stream); return;
         default: break;
     }
     const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;

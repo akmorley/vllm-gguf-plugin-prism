@@ -31,7 +31,6 @@ from .params import (
 )
 from .utils import (
     DEQUANT_TYPES,
-    IMATRIX_QUANT_TYPES,
     MMQ_QUANT_TYPES,
     MMVQ_QUANT_TYPES,
     UNQUANTIZED_TYPES,
@@ -40,6 +39,10 @@ from .utils import (
 _EXPERIMENTAL_PREPARED_PQ2 = os.environ.get("GGUF_PQ2_PREPARED", "0") == "1"
 _DEQUANT_GEMM_MIN_BATCH = int(os.environ.get("GGUF_DEQUANT_GEMM_MIN_BATCH", "32"))
 _DEQUANT_GEMM_CHUNK_ELEMS = 64 * 1024 * 1024
+# MMVQ reads each weight block once for up to 16 vectors (more fall back to a per-vector
+# kernel). Through 16 rows it beats MMQ by 1.3-2.9x on Q5_K/Q6_K shapes (RTX 3090), which keeps
+# concurrent speculative verification (e.g. 4 requests x 3 tokens) off MMQ.
+_MMVQ_MAX_ROWS = 16
 
 
 def _dequant_gemm(
@@ -88,12 +91,7 @@ def _fused_mul_mat_gguf(
 ) -> torch.Tensor:
     if pq2_prepared and (weight_type != WeightType.PQ2_0 or not x.is_cuda):
         raise ValueError("Prepared weights require CUDA PQ2 execution")
-    # MMVQ reads each weight block once for up to 8 vectors (more fall back to a per-vector
-    # kernel); at 8 rows it is still 1.5-2x faster than MMQ on 3090 Ti Q5_K/Q6_K shapes.
-    if weight_type in IMATRIX_QUANT_TYPES:
-        mmvq_safe = 8 if weight.shape[0] > 5120 else 16
-    else:
-        mmvq_safe = 8
+    mmvq_safe = _MMVQ_MAX_ROWS
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type == WeightType.PQ2_0 and x.is_cuda:
@@ -130,6 +128,20 @@ def _fused_mul_mat_gguf_fake(
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
 
+def _fused_mul_mat_gguf_prequantized(
+    x: torch.Tensor, quant_x: torch.Tensor, weight: torch.Tensor, weight_type: int
+) -> torch.Tensor:
+    return ops.ggml_mul_mat_vec_a8_prequantized(
+        weight, x, quant_x, weight_type, weight.shape[0]
+    )
+
+
+def _fused_mul_mat_gguf_prequantized_fake(
+    x: torch.Tensor, quant_x: torch.Tensor, weight: torch.Tensor, weight_type: int
+) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+
+
 try:
     direct_register_custom_op(
         op_name="_fused_mul_mat_gguf",
@@ -137,6 +149,12 @@ try:
         fake_impl=_fused_mul_mat_gguf_fake,
     )
     fused_mul_mat_gguf = torch.ops.vllm._fused_mul_mat_gguf
+    direct_register_custom_op(
+        op_name="_fused_mul_mat_gguf_prequantized",
+        op_func=_fused_mul_mat_gguf_prequantized,
+        fake_impl=_fused_mul_mat_gguf_prequantized_fake,
+    )
+    fused_mul_mat_gguf_prequantized = torch.ops.vllm._fused_mul_mat_gguf_prequantized
 except AttributeError as error:
     raise error
 
@@ -388,8 +406,15 @@ class GGUFLinearMethod(LinearMethodBase):
 
             else:
                 # Mixed GGUF types: execute each logical shard using
-                # its own type and concatenate the results.
+                # its own type and concatenate the results. Every shard reads
+                # the same x, so on the MMVQ path quantize it to Q8_1 once
+                # (e.g. Qwen3.5 attention q/k/v as Q5_K/Q5_K/Q6_K: 3 -> 1).
                 result = []
+                quant_x = None
+                if x.shape[0] <= _MMVQ_MAX_ROWS and all(
+                    t in MMVQ_QUANT_TYPES for t in shard_weight_types
+                ):
+                    quant_x = ops.ggml_quantize_q8_1(x)
 
                 for idx in shard_id:
                     weight_type = (
@@ -399,11 +424,16 @@ class GGUFLinearMethod(LinearMethodBase):
                         )
                     )
 
-                    shard_out = fused_mul_mat_gguf_op(
-                        x,
-                        gguf_shard_weight(weight, idx),
-                        weight_type,
-                    )
+                    if quant_x is not None:
+                        shard_out = fused_mul_mat_gguf_prequantized(
+                            x, quant_x, gguf_shard_weight(weight, idx), weight_type
+                        )
+                    else:
+                        shard_out = fused_mul_mat_gguf_op(
+                            x,
+                            gguf_shard_weight(weight, idx),
+                            weight_type,
+                        )
 
                     result.append(shard_out)
 
