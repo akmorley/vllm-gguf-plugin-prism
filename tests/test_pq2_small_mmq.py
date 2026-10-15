@@ -195,3 +195,17 @@ def test_ring_dispatch_scope(enabled,monkeypatch):
     w2=_weight(34816,5120)
     for m in (4,8):small.pq2_small_mmq(torch.randn(m,5120,device='cuda',dtype=torch.bfloat16),w2)
     assert seen==[]
+
+
+def test_ring_exact_only_switch(enabled,monkeypatch):
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    monkeypatch.setattr(small,'_RING_EXACT_ONLY',True)
+    for m,t in small.RING_BY_M.items():
+        for n,k in t:
+            assert (small.ring_for(m,n,k) is not None)==((m,n,k) in small.RING_EXACT),(m,n,k)
+    n,k=5120,17408;w=_weight(n,k);x=torch.randn(8,k,device='cuda',dtype=torch.bfloat16)
+    monkeypatch.setattr(small,'_RING',False)
+    base=small.pq2_small_mmq(x,w)
+    monkeypatch.setattr(small,'_RING',True)
+    assert torch.equal(small.pq2_small_mmq(x,w),base)   # `down` is not in RING_EXACT: previous path, identical

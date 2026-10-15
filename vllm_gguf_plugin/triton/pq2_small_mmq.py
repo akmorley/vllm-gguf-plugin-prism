@@ -213,6 +213,9 @@ RING_BY_M = {
 # kernel): outputs are bit-identical. Split-K entries differ at the FP32 rounding level.
 RING_EXACT = {(6, 5120, 6144), (7, 5120, 6144), (8, 5120, 6144), (7, 14336, 5120), (8, 14336, 5120)}
 _RING = os.environ.get("GGUF_PQ2_SMALL_MMQ_RING", "1") == "1"
+# GGUF_PQ2_SMALL_MMQ_RING_EXACT=1 keeps only the entries in RING_EXACT (bit-identical outputs); the split-K `down`
+# entries (the largest gain, FP32 rounding-level reordering) are then left on the previous path.
+_RING_EXACT_ONLY = os.environ.get("GGUF_PQ2_SMALL_MMQ_RING_EXACT", "0") == "1"
 _RING_WS = {}
 
 
@@ -223,6 +226,8 @@ def _ring_available():
 def ring_for(m, n, k):
     """(cfg, split) for the ring kernel, or None."""
     if not _RING or not RING_BY_M or not _ring_available():
+        return None
+    if _RING_EXACT_ONLY and (m, n, k) not in RING_EXACT:
         return None
     return RING_BY_M.get(m, {}).get((n, k))
 

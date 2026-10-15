@@ -229,6 +229,7 @@ def _register_pq2_compile_factors() -> None:
     )
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RT"] = lambda: pq2_small_mmq._CUDA_RT
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RING"] = lambda: pq2_small_mmq._RING
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RING_EXACT"] = lambda: pq2_small_mmq._RING_EXACT_ONLY
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
         pq2_small_mmq._SMALL_MMQ_OUTPUT
     )
