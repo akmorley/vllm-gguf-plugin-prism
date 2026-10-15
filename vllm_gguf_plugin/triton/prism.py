@@ -13,6 +13,12 @@ from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 _EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
 _EXPERIMENTAL_INT_OUTPUT = os.environ.get("GGUF_PQ2_INT_OUTPUT", "1") == "1"
 _EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
+# Also send the (5120, 6144) output projections to MMQ at M >= 128 prefill instead of the
+# floating _pq2 kernel (~1.9-2.2x per call). Quantizes their activations to INT8 (~0.7% relative
+# output change, the same treatment the other MMQ projections already get). Default on after
+# GSM8K 120 -> 121/128, GPQA-Diamond 69 -> 66/198 (paired SE 2.5 pp) and 2K-32K perplexity
+# showed no regression (pq2-mmq-output-taskquality-20261015). GGUF_PQ2_MMQ_OUTPUT=0 reverts.
+_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_MMQ_OUTPUT", "1") == "1"
 # Bit-exact: smaller floating row tiles for (5120, 6144) at M = 5..16 (8 rows up to M = 8,
 # 16 rows above), instead of padding to 64.
 _SMALL_FLOAT_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_FLOAT_OUTPUT", "1") == "1"
@@ -61,6 +67,46 @@ def _hadamard(
     tl.store(Y + offset, v)
 
 
+@triton.jit
+def _hadamard_rows(
+    X,
+    S,
+    Y,
+    N,
+    WIDTH: tl.constexpr,
+    B: tl.constexpr,
+    R: tl.constexpr,
+    SIGNS: tl.constexpr,
+    INVERSE: tl.constexpr,
+):
+    # Same arithmetic as _hadamard, R blocks per program: ~1.8x faster at prefill sizes where
+    # one block per program leaves the kernel ~2.3x off the memory roofline.
+    r = tl.arange(0, R)[:, None]
+    i = tl.arange(0, B)[None, :]
+    offset = (tl.program_id(0) * R + r) * B + i
+    mask = offset < N
+    v = tl.load(X + offset, mask, other=0).to(tl.float32)
+    if SIGNS:
+        signs = tl.load(S + offset % WIDTH, mask, other=0).to(tl.float32)
+        if not INVERSE:
+            v *= signs
+    for stage in tl.static_range(0, tl.constexpr(B.bit_length() - 1)):
+        h = 1 << stage
+        other = tl.gather(v, (i ^ h) + r * 0, 1)
+        v = tl.where((i & h) == 0, v + other, other - v)
+    v *= B**-0.5
+    if SIGNS and INVERSE:
+        v *= signs
+    tl.store(Y + offset, v, mask)
+
+
+# Below this many Hadamard blocks (decode and small verification batches) the one-block kernel
+# keeps more programs in flight.
+_HADAMARD_ROWS_MIN_BLOCKS = (
+    512 if os.environ.get("GGUF_PQ2_PREFILL_ROWS", "1") == "1" else 1 << 60
+)
+
+
 def hadamard(x, signs, block_size, inverse=False):
     if block_size <= 0 or block_size & (block_size - 1):
         raise ValueError("Hadamard block size must be a power of two")
@@ -68,7 +114,22 @@ def hadamard(x, signs, block_size, inverse=False):
         raise ValueError("Activation width must be divisible by Hadamard block size")
     x = x.contiguous()
     y = torch.empty_like(x)
-    if x.numel():
+    blocks = x.numel() // block_size
+    rows = max(1, 1024 // block_size)
+    if blocks >= _HADAMARD_ROWS_MIN_BLOCKS and rows > 1:
+        _hadamard_rows[(triton.cdiv(blocks, rows),)](
+            x,
+            signs if signs is not None else x,
+            y,
+            x.numel(),
+            x.shape[-1],
+            block_size,
+            rows,
+            signs is not None,
+            inverse,
+            num_warps=4,
+        )
+    elif x.numel():
         _hadamard[(x.numel() // block_size,)](
             x,
             signs if signs is not None else x,
@@ -164,7 +225,7 @@ def pq2_matmul(x, weight, *, prepared=False):
     if (
         _EXPERIMENTAL_MMQ
         and m >= 128
-        and (n, k) in _BATCHED_GEMV_SHAPES
+        and ((n, k) in _BATCHED_GEMV_SHAPES or (_MMQ_OUTPUT and (n, k) == (5120, 6144)))
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.is_cuda
         and torch.cuda.get_device_capability(x.device) == (8, 6)

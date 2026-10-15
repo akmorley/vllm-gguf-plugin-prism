@@ -158,7 +158,7 @@ def _register_pq2_compile_factors() -> None:
 
     from . import attention
     from .quantization import linear
-    from .triton import pq2_int_gemv, pq2_small_mmq, prism
+    from .triton import pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -166,8 +166,12 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
     envs.environment_variables["GGUF_PQ2_MMQ"] = lambda: prism._EXPERIMENTAL_MMQ
     envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
-        "q8-groups-m128-byte32-v3"
+        "q8-groups-m128-byte32-v4-tiles-rows"
     )
+    envs.environment_variables["GGUF_PQ2_MMQ_TUNED_TILES"] = lambda: (
+        pq2_mmq._TUNED_TILES
+    )
+    envs.environment_variables["GGUF_PQ2_PREFILL_ROWS"] = lambda: pq2_mmq._QUANT_ROWS
 
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
         attention._SINGLE_ATTN_BACKEND
@@ -218,6 +222,7 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SMALL_FLOAT_OUTPUT"] = lambda: (
         prism._SMALL_FLOAT_OUTPUT
     )
+    envs.environment_variables["GGUF_PQ2_MMQ_OUTPUT"] = lambda: prism._MMQ_OUTPUT
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ"] = lambda: (
         pq2_small_mmq._SMALL_MMQ
     )
