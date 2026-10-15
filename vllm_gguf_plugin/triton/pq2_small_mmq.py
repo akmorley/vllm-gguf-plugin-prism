@@ -26,7 +26,7 @@ _SMALL_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_MMQ_OUTPUT", "1") == "1"
 OUTPUT_CUDA = (2, 8)  # (warps, groups in flight), RTX 3090 Ti microbenchmark, M = 2..8
 # Register-tiled CUDA variants (row tiles per warp > 1); GGUF_PQ2_SMALL_MMQ_RT=0 restores one tile per warp.
 _CUDA_RT = os.environ.get("GGUF_PQ2_SMALL_MMQ_RT", "1") == "1"
-_VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v2-rt"
+_VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v3-rt-ring"
 _MAX_M = 64
 _CALLS = 0  # Python-side launches (warmup and graph capture); replay does not re-enter.
 # M -> (N, K) -> (rows per program, groups per iteration, warps, pipeline stages, K splits).
@@ -189,6 +189,73 @@ CUDA_RT_BY_M = {
 }
 
 
+# cp.async-ring CUDA kernel (csrc/pq2/pq2_mma_ring.cu): weights and activations are staged in shared memory so every
+# DRAM request is a >= 64 B row segment. The direct-fragment kernel above issues one 32 B piece per row per group,
+# which limits it on the narrow projections (N = 5120) and at M >= 6 for the wide ones.
+# M -> (N, K) -> (cfg, split). cfg selects the CTA tile in pq2_mma_ring.cu; split > 1 is split-K with a fused
+# fixed-order reduction (deterministic). Entries in RING_EXACT sum in the same order as the path they replace, so the
+# output is bit-identical; the rest differ at the FP32 rounding level (relative RMS ~1e-4) and are deterministic.
+# Selected on RTX 3090 Ti against the paths above and confirmed on the captured real batch-8 decode data (257 projections:
+# 13.70 -> 12.43 ms per step); in_proj and gate/up showed no gain on real data and stay on the direct-fragment kernel.
+# (pq2-decode-kernel-design-20261015)
+_RING_DOWN_OUT = {(5120, 17408): (1, 2), (5120, 6144): (1, 2)}
+_RING_WIDE = {(5120, 17408): (1, 2), (5120, 6144): (6, 1), (14336, 5120): (9, 1)}
+RING_BY_M = {
+    2: {(5120, 17408): (1, 2), (5120, 6144): (9, 4)},
+    3: _RING_DOWN_OUT,
+    4: _RING_DOWN_OUT,
+    5: _RING_DOWN_OUT,
+    6: {(5120, 17408): (1, 2), (5120, 6144): (6, 1)},
+    7: _RING_WIDE,
+    8: _RING_WIDE,
+}
+# (M, N, K) entries that sum in the same order as the path they replace (split 1 against the unsplit direct-fragment
+# kernel): outputs are bit-identical. Split-K entries differ at the FP32 rounding level.
+RING_EXACT = {(6, 5120, 6144), (7, 5120, 6144), (8, 5120, 6144), (7, 14336, 5120), (8, 14336, 5120)}
+_RING = os.environ.get("GGUF_PQ2_SMALL_MMQ_RING", "1") == "1"
+_RING_WS = {}
+
+
+def _ring_available():
+    return (_cuda_available() and hasattr(torch.ops._C_gguf, "pq2_mma_ring"))
+
+
+def ring_for(m, n, k):
+    """(cfg, split) for the ring kernel, or None."""
+    if not _RING or not RING_BY_M or not _ring_available():
+        return None
+    return RING_BY_M.get(m, {}).get((n, k))
+
+
+def _ring_workspace(device):
+    """Persistent split-K scratch: FP32 partials and zero-initialised self-resetting tile counters."""
+    ws = _RING_WS.get(device)
+    if ws is None:
+        partial = max((sp * m * n for m, t in RING_BY_M.items() for (n, _k), (_c, sp) in t.items() if sp > 1),
+                      default=1)
+        ws = (torch.empty(partial, dtype=torch.float32, device=device),
+              torch.zeros(16384, dtype=torch.int32, device=device))
+        _RING_WS[device] = ws
+    return ws
+
+
+def _pq2_mma_ring(x, weight, cfg, split):
+    from .pq2_mmq import _quantize_prefill
+
+    m, k = x.shape
+    n = weight.shape[0]
+    x = x.contiguous()
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    s = torch.empty((m, k // 128), dtype=torch.float32, device=x.device)
+    t = torch.empty((m, k // 128), dtype=torch.int32, device=x.device)
+    groups = m * (k // 128)
+    _quantize_prefill[(triton.cdiv(groups, 8),)](x, q, s, t, groups, 8, num_warps=4)
+    y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    partial, counters = _ring_workspace(x.device)
+    torch.ops._C_gguf.pq2_mma_ring(q, s, t, weight, y, partial, counters, cfg, split)
+    return y
+
+
 def cuda_for(m, n, k):
     """(warps, groups in flight, row tiles per warp) for the CUDA MMA kernel, or None."""
     if not _cuda_available():
@@ -304,7 +371,8 @@ def eligible(x, weight, prepared):
         enabled
         and x.dtype in (torch.bfloat16, torch.float16)
         and (geometry_for(m, weight.shape[0], x.shape[1]) is not None
-             or cuda_for(m, weight.shape[0], x.shape[1]) is not None)
+             or cuda_for(m, weight.shape[0], x.shape[1]) is not None
+             or ring_for(m, weight.shape[0], x.shape[1]) is not None)
         and torch.cuda.get_device_capability(x.device) == (8, 6)
     )
 
@@ -315,6 +383,9 @@ def pq2_small_mmq(x, weight, geometry=None):
     _CALLS += 1
     m, k = x.shape
     n = weight.shape[0]
+    ring = None if geometry is not None else ring_for(m, n, k)
+    if ring is not None:
+        return _pq2_mma_ring(x, weight, *ring)
     cuda = None if geometry is not None else cuda_for(m, n, k)
     if cuda is not None:
         return _pq2_mma_small(x, weight, *cuda)
