@@ -228,6 +228,7 @@ def _register_pq2_compile_factors() -> None:
         pq2_small_mmq._SMALL_MMQ
     )
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RT"] = lambda: pq2_small_mmq._CUDA_RT
+    envs.environment_variables["GGUF_PQ2_M1_CUDA"] = lambda: pq2_int_gemv._M1_CUDA
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RING"] = lambda: pq2_small_mmq._RING
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RING_EXACT"] = lambda: pq2_small_mmq._RING_EXACT_ONLY
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
@@ -237,7 +238,7 @@ def _register_pq2_compile_factors() -> None:
         pq2_small_mmq._VERSION
     )
     envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: (
-        "prmt-v2-tiles-batch8-chained-v5"
+        "prmt-v2-tiles-batch8-chained-v5-m1cuda"
     )
 
 
