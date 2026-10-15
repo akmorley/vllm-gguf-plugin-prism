@@ -166,12 +166,13 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
     envs.environment_variables["GGUF_PQ2_MMQ"] = lambda: prism._EXPERIMENTAL_MMQ
     envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
-        "q8-groups-m128-byte32-v4-tiles-rows"
+        "q8-groups-m128-byte32-v5-mma-prefill"
     )
     envs.environment_variables["GGUF_PQ2_MMQ_TUNED_TILES"] = lambda: (
         pq2_mmq._TUNED_TILES
     )
     envs.environment_variables["GGUF_PQ2_PREFILL_ROWS"] = lambda: pq2_mmq._QUANT_ROWS
+    envs.environment_variables["GGUF_PQ2_MMA_PREFILL"] = lambda: pq2_mmq._MMA_PREFILL
 
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
         attention._SINGLE_ATTN_BACKEND
@@ -226,6 +227,7 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ"] = lambda: (
         pq2_small_mmq._SMALL_MMQ
     )
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RT"] = lambda: pq2_small_mmq._CUDA_RT
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
         pq2_small_mmq._SMALL_MMQ_OUTPUT
     )
