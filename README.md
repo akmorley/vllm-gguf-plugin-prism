@@ -101,3 +101,96 @@ to the corresponding Hugging Face model. A model appearing in vLLM's general
 supported-model list does not by itself guarantee GGUF compatibility. When
 reporting an unsupported model, include the model repository, quantization,
 plugin and vLLM versions, and the complete weight-mapping error.
+
+## Prism serving benchmark
+
+Use the serving benchmark guide (`benchmarks/plugin-archive/benchmarks/SERVING.md` in the
+containing workspace) to measure the local
+27B model across prompt lengths and request concurrency. The harness saves
+throughput, latency percentiles, GPU memory samples, and raw vLLM results.
+
+The experimental PQ2 integer decode guide
+(`benchmarks/plugin-archive/benchmarks/PQ2_INTEGER_DECODE.md` in the containing workspace)
+documents the default-off `GGUF_PQ2_INT_GEMV=1` experiment, measured dispatch
+rules, kernel results, and numerical acceptance work.
+
+## PQ2 single-request decode defaults
+
+The optimized PQ2 decode path defaults to the prepared single-token byte kernel
+(`GGUF_PQ2_SINGLE_GEMV=1`) with fixed per-shape tiles and PRMT code decoding.
+These apply when the integer-decode path is enabled. For the tested optimized
+serving configuration, use `GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`, and
+`GGUF_PQ2_MMQ=1` (MMQ activation group 128).
+
+The single-token specialization selects only the six measured projection
+shapes on SM86 with BF16/FP16 and prepared weights. Other inputs retain their
+existing dispatch. Batch-eight chaining (`GGUF_PQ2_BATCH8_CHAINED=1`) and the
+small floating output-projection tiles at M = 5..16
+(`GGUF_PQ2_SMALL_FLOAT_OUTPUT=1`, bit-exact) are default-on. Resolved settings
+and kernel versions enter the compilation cache identity.
+
+To use the generic integer kernel at M = 1 instead, set
+`GGUF_PQ2_SINGLE_GEMV=0`.
+
+Superseded experiment switches (`GGUF_PQ2_BATCHED_GEMV`,
+`GGUF_PQ2_INT_GEMV_VARIANT`, `GGUF_PQ2_INT_GEMV_DECODE`,
+`GGUF_PQ2_INT_GEMV_CHAINED`, `GGUF_PQ2_MMQ_GROUP`,
+`GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM`, `GGUF_PQ2_BATCH8_SMALL_MMQ`) have been
+removed and are ignored if set.
+The experimental attention split override is not enabled by this promotion.
+
+Full-model measurements with 4096 input and 2048 generated tokens showed
+18.22% and 17.62% higher generation throughput on the two RTX 3090 Ti GPUs.
+
+## Small batches and speculative decoding (defaults)
+
+Within the integer-decode path (`GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`,
+SM86), these are on by default:
+
+| Switch | Effect | Disable |
+|---|---|---|
+| `GGUF_PQ2_SMALL_MMQ` | INT8 tensor-core projections for M = 2..64 (direct-fragment CUDA kernel for M <= 8, Triton with 16/32/64-row token tiles above); also tiles the M = 2..4 floating output projection | `=0` |
+| `GGUF_PQ2_SMALL_MMQ_OUTPUT` | the 5120x6144 output projection at M = 2..8 through the INT8 kernel (as at M = 1); ~0.7% relative change on those outputs | `=0` |
+| `GGUF_PQ2_VERIFY_ATTN` | split-KV attention for 2..16-token queries of one request (speculative verification), exact prefix/tail decomposition | `=0` |
+
+DFlash2 speculative decoding is a server option. On RTX 3090/3090 Ti cards the
+measured best is five draft tokens with an FP8 draft:
+
+```bash
+GGUF_PQ2_INT_GEMV=1 GGUF_PQ2_PREPARED=1 GGUF_PQ2_MMQ=1 \
+vllm serve Ternary-Bonsai-2-27B-PQ2_0.gguf --tokenizer <qwen3.8 tokenizer> \
+  --speculative-config '{"method": "dflash", "model": "<bonsai-dflash2 BF16 dir>", "num_speculative_tokens": 5, "quantization": "fp8"}'
+```
+
+The FP8 draft needs a vLLM build with quantized DFlash context-K/V support
+(`vllm-prism` branch `dflash-quantized-context-kv`); without it, omit
+`"quantization"` (BF16 draft, about 10% slower). Measured on one RTX 3090 Ti:
+about 2.0-2.3x plain decoding for one request from 4K to 32K context, 1.8x at
+two concurrent requests and 1.4x at four. At eight concurrent requests plain
+decoding is faster, so do not enable speculation for heavily batched serving.
+
+## Optional single-request Triton attention
+
+To keep FlashAttention 2 for prefill and use Triton for the measured
+single-request decode shape, set these variables before starting the server:
+
+```bash
+GGUF_PQ2_SINGLE_ATTN_BACKEND=triton \
+GGUF_PQ2_SINGLE_ATTN_SEGMENTS=32 \
+vllm serve MODEL.gguf --attention-backend FLASH_ATTN [other options]
+```
+
+The option is disabled by default (`GGUF_PQ2_SINGLE_ATTN_BACKEND=fa2`).
+It supports BF16 queries with 24 query heads, four KV heads and head dimension
+256 on SM86. Prefill, batched decode, other GPUs/shapes/dtypes, sliding-window
+attention, softcaps, auxiliary features and context parallelism retain FA2.
+The existing paged KV layout is preserved, including 784-token hybrid pages.
+Softmax scratch is allocated per call and retained by CUDA graph capture. The resolved backend, segment
+count and implementation version enter vLLM's compilation cache identity.
+Restart the server when changing settings.
+
+A 64-segment option is also available; 32 is the tested starting point.
+Keep the `FLASH_ATTN` vLLM backend selected: this setting changes only eligible
+FA2 calls and does not replace other configured attention backends. This is an
+experimental option: numerical and graph checks passed, but greedy generated
+text can change. Language-quality evaluation is required before promotion.

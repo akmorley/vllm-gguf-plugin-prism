@@ -1,9 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prism kernels: packed PQ2 multiplication and normalized block FWHT."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
+
+# Read once before graph capture; opt-in while model/serving acceptance is pending.
+_EXPERIMENTAL_INT_GEMV = os.environ.get("GGUF_PQ2_INT_GEMV", "0") == "1"
+_EXPERIMENTAL_INT_OUTPUT = os.environ.get("GGUF_PQ2_INT_OUTPUT", "1") == "1"
+_EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
+# Bit-exact: smaller floating row tiles for (5120, 6144) at M = 5..16 (8 rows up to M = 8,
+# 16 rows above), instead of padding to 64.
+_SMALL_FLOAT_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_FLOAT_OUTPUT", "1") == "1"
+_BATCHED_GEMV_SHAPES = frozenset(
+    {(34816, 5120), (5120, 17408), (16384, 5120), (14336, 5120), (248320, 5120)}
+)
+
+
+def _use_int_gemv(x, n, k):
+    # Only measured batches/shapes: M=16 gains are too close to noise to select.
+    return (
+        _EXPERIMENTAL_INT_GEMV
+        and x.shape[0] in (1, 2, 4, 5, 8)
+        and ((n, k) in _BATCHED_GEMV_SHAPES
+             or (_EXPERIMENTAL_INT_OUTPUT and (n, k) == (5120, 6144) and x.shape[0] == 1))
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    )
 
 
 @triton.jit
@@ -53,18 +81,19 @@ def hadamard(x, signs, block_size, inverse=False):
     return y
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _pq2(
     X,
     W,
     Y,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     STRIDE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    PREPARED: tl.constexpr = False,
 ):
     m = tl.program_id(0) * BM + tl.arange(0, BM)
     n = tl.program_id(1) * BN + tl.arange(0, BN)
@@ -77,59 +106,133 @@ def _pq2(
             (m[:, None] < M) & (k[None, :] < K),
             other=0,
         )
-        block = k // 128
-        address = n[None, :] * STRIDE + block[:, None] * 34
-        lo = tl.load(W + address, (n[None, :] < N) & (k[:, None] < K), other=0).to(
-            tl.uint16
-        )
-        hi = tl.load(W + address + 1, (n[None, :] < N) & (k[:, None] < K), other=0).to(
-            tl.uint16
-        )
-        scale = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        packed = tl.load(
-            W + address + 2 + (k[:, None] % 128) // 4,
-            (n[None, :] < N) & (k[:, None] < K),
-            other=0,
-        )
-        code = ((packed.to(tl.int32) >> (2 * (k[:, None] % 4))) & 3) - 1
-        b = (code.to(tl.float32) * scale).to(a.dtype)
+        if PREPARED:
+            tl.static_assert(BK == 128, "Prepared GEMM requires a scale-aligned K tile")
+            byte = tl.arange(0, 32)
+            packed = _pq2_codes(
+                W, n[None, :], base, byte[:, None], K, STRIDE, n[None, :] < N, True
+            )
+            shifts = 2 * tl.arange(0, 4)
+            code = ((packed.to(tl.int32)[:, None, :] >> shifts[None, :, None]) & 3) - 1
+            code = tl.reshape(code, (BK, BN))
+            scale = _pq2_scale(W, n, base, N, K, STRIDE, n < N, True)
+            b = (code.to(tl.float32) * scale[None, :]).to(a.dtype)
+        else:
+            block = k // 128
+            mask = (n[None, :] < N) & (k[:, None] < K)
+            scale = _pq2_scale(W, n[None, :], block[:, None], N, K, STRIDE, mask, False)
+            packed = _pq2_codes(
+                W,
+                n[None, :],
+                block[:, None],
+                (k[:, None] % 128) // 4,
+                K,
+                STRIDE,
+                mask,
+                False,
+            )
+            code = ((packed.to(tl.int32) >> (2 * (k[:, None] % 4))) & 3) - 1
+            b = (code.to(tl.float32) * scale).to(a.dtype)
         acc += tl.dot(a, b, input_precision="ieee")
     tl.store(Y + m[:, None] * N + n[None, :], acc, (m[:, None] < M) & (n[None, :] < N))
 
 
-def pq2_matmul(x, weight):
+def pq2_matmul(x, weight, *, prepared=False):
     """Dequantize only a tile at a time, never materializing a dense weight."""
     m, k = x.shape
     n = weight.shape[0]
     if k % 128 or weight.shape[1] != k // 128 * 34:
         raise ValueError("Invalid PQ2 packed matrix shape")
     x = x.contiguous()
+    if prepared:
+        validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if prepared:
+        from . import pq2_small_mmq
+
+        if pq2_small_mmq.eligible(x, weight, prepared):
+            return pq2_small_mmq.pq2_small_mmq(x, weight)
+    if _use_int_gemv(x, n, k):
+        from .pq2_int_gemv import pq2_int_gemv
+
+        if prepared:
+            return pq2_int_gemv(x, weight, prepared=True)
+        return pq2_int_gemv(x, weight)
+    # M>=128 is the measured large-prefill range. Small/decode batches keep
+    # their existing path; this default-off experiment changes activations.
+    if (
+        _EXPERIMENTAL_MMQ
+        and m >= 128
+        and (n, k) in _BATCHED_GEMV_SHAPES
+        and x.dtype in (torch.bfloat16, torch.float16)
+        and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    ):
+        from .pq2_mmq import pq2_mmq
+
+        return pq2_mmq(x, weight, prepared=prepared)
     y = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    if m and n and m <= 4 and k <= 32768:
+    # With the small-batch opt-in, M = 2..4 floating output projections use the 8-row tile
+    # instead of the per-token GEMV (which re-reads the weights for every token). Floating
+    # reduction order changes (~1e-4 relative); not bit-exact with the GEMV.
+    from . import pq2_small_mmq
+
+    tile_output = (
+        pq2_small_mmq._SMALL_MMQ and 2 <= m <= 4 and (n, k) == (5120, 6144)
+        and x.dtype in (torch.bfloat16, torch.float16) and x.is_cuda
+        and torch.cuda.get_device_capability(x.device) == (8, 6)
+    )
+    if m and n and m <= 4 and k <= 32768 and not tile_output:
         _pq2_gemv[(n, m)](
-            x, weight, y, n, k, weight.stride(0), triton.next_power_of_2(k)
+            x, weight, y, n, k, weight.stride(0), triton.next_power_of_2(k), prepared
         )
     elif m and n:
-        _pq2[(triton.cdiv(m, 64), triton.cdiv(n, 64))](
-            x, weight, y, m, n, k, weight.stride(0), 64, 64, 128
+        small_output = (
+            (n, k) == (5120, 6144)
+            and x.dtype in (torch.bfloat16, torch.float16)
+            and x.is_cuda
+            and torch.cuda.get_device_capability(x.device) == (8, 6)
+        )
+        if small_output and _SMALL_FLOAT_OUTPUT and 5 <= m <= 16:
+            bm = 8 if m <= 8 else 16
+        elif tile_output:
+            bm = 8
+        else:
+            bm = 64
+        _pq2[(triton.cdiv(m, bm), triton.cdiv(n, 64))](
+            x,
+            weight,
+            y,
+            m,
+            n,
+            k,
+            weight.stride(0),
+            bm,
+            64,
+            128,
+            prepared,
+            num_stages=2 if prepared and x.dtype == torch.float32 else 3,
         )
     return y
 
 
 @triton.jit
 def _pq2_gemv(
-    X, W, Y, N: tl.constexpr, K: tl.constexpr, STRIDE: tl.constexpr, B: tl.constexpr
+    X,
+    W,
+    Y,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    STRIDE: tl.constexpr,
+    B: tl.constexpr,
+    PREPARED: tl.constexpr = False,
 ):
     row = tl.program_id(0)
     token = tl.program_id(1)
     k = tl.arange(0, B)
-    address = row * STRIDE + (k // 128) * 34
-    lo = tl.load(W + address, k < K, other=0).to(tl.uint16)
-    hi = tl.load(W + address + 1, k < K, other=0).to(tl.uint16)
-    scale = (lo | (hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-    packed = tl.load(W + address + 2 + (k % 128) // 4, k < K, other=0)
+    scale = _pq2_scale(W, row, k // 128, N, K, STRIDE, k < K, PREPARED)
+    packed = _pq2_codes(W, row, k // 128, (k % 128) // 4, K, STRIDE, k < K, PREPARED)
     code = ((packed.to(tl.int32) >> (2 * (k % 4))) & 3) - 1
     a = tl.load(X + token * K + k, k < K, other=0)
     # Match the activation dtype used by the dense fallback.

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
@@ -12,6 +14,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .. import ops
+from ..hadamard import (
+    HadamardRuntimeConfig,
+    apply_forward_hadamard,
+)
 from .layout import GGUFLinearLayout
 from .params import (
     GGUFUninitializedWeightParameter,
@@ -30,10 +36,8 @@ from .utils import (
     MMVQ_QUANT_TYPES,
     UNQUANTIZED_TYPES,
 )
-from ..hadamard import (
-    HadamardRuntimeConfig,
-    apply_forward_hadamard,
-)
+
+_EXPERIMENTAL_PREPARED_PQ2 = os.environ.get("GGUF_PQ2_PREPARED", "0") == "1"
 
 def debug_plain_rmsnorm(
     x: torch.Tensor,
@@ -52,8 +56,11 @@ def debug_plain_rmsnorm(
 
 
 def _fused_mul_mat_gguf(
-    x: torch.Tensor, weight: torch.Tensor, weight_type: int
+    x: torch.Tensor, weight: torch.Tensor, weight_type: int,
+    pq2_prepared: bool = False,
 ) -> torch.Tensor:
+    if pq2_prepared and (weight_type != WeightType.PQ2_0 or not x.is_cuda):
+        raise ValueError("Prepared weights require CUDA PQ2 execution")
     if weight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if weight.shape[0] > 5120 else 16
     else:
@@ -62,7 +69,7 @@ def _fused_mul_mat_gguf(
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type == WeightType.PQ2_0 and x.is_cuda:
         from ..triton.prism import pq2_matmul
-        return pq2_matmul(x, weight)
+        return pq2_matmul(x, weight, prepared=pq2_prepared)
     if weight_type in UNQUANTIZED_TYPES:
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
@@ -84,6 +91,7 @@ def _fused_mul_mat_gguf_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_type: int,
+    pq2_prepared: bool = False,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -183,6 +191,30 @@ class GGUFLinearMethod(LinearMethodBase):
                 f"Unsupported GGUF quantization type {weight_type} in layer {layer}."
             )
         self._create_padded_weight_param(layer)
+        self._prepare_pq2_weight(layer)
+
+    def _prepare_pq2_weight(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight
+        # The parameter owns the marker so tied embeddings/heads share both
+        # data and layout and never prepare the same allocation twice.
+        if getattr(weight, "gguf_pq2_prepared", False):
+            return
+        if not _EXPERIMENTAL_PREPARED_PQ2 or not weight.is_cuda:
+            return
+        types = {layer.weight_type.shard_weight_type.get(
+            shard, layer.weight_type.weight_type) for shard in weight.shard_id}
+        if not types:
+            types = {layer.weight_type.weight_type}
+        if types != {WeightType.PQ2_0}:
+            return
+        if torch.cuda.get_device_capability(weight.device) != (8, 6):
+            return
+        from ..triton.pq2_layout import prepare_pq2_layout
+
+        weight.data = prepare_pq2_layout(weight)
+        weight.gguf_pq2_prepared = True
+        # Single-shard parameters can retain their original load tensor.
+        weight.data_container.clear()
 
     def _materialize_gguf_parameters(self, layer: torch.nn.Module) -> None:
         self._materialize_weight(layer)
@@ -285,11 +317,10 @@ class GGUFLinearMethod(LinearMethodBase):
             # All packed shards have the same GGUF type, so the whole
             # packed tensor can be handled by one kernel invocation.
             if len(set(shard_weight_types)) == 1:
-                out = fused_mul_mat_gguf_op(
-                    x,
-                    weight,
-                    shard_weight_types[0],
-                )
+                if getattr(weight, "gguf_pq2_prepared", False):
+                    out = fused_mul_mat_gguf_op(x, weight, shard_weight_types[0], True)
+                else:
+                    out = fused_mul_mat_gguf_op(x, weight, shard_weight_types[0])
 
             else:
                 # Mixed GGUF types: execute each logical shard using
@@ -323,7 +354,10 @@ class GGUFLinearMethod(LinearMethodBase):
             weight = layer.weight
             weight_type = layer.weight_type.weight_type
 
-            out = fused_mul_mat_gguf_op(x,weight,weight_type)
+            if getattr(weight, "gguf_pq2_prepared", False):
+                out = fused_mul_mat_gguf_op(x, weight, weight_type, True)
+            else:
+                out = fused_mul_mat_gguf_op(x,weight,weight_type)
 
         if bias is not None:
             out.add_(bias)

@@ -86,7 +86,30 @@ def _patch_engine_args() -> None:
         if self.speculative_config is not None:
             configured_model = configured_model or self.speculative_config.get("model")
 
-        config = original_create_speculative_config(self, *args, **kwargs)
+        # The draft ModelConfig inherits the target's config_format. A GGUF target
+        # forces "gguf", which would re-read a separate safetensors draft (e.g. a
+        # DFlash2 head) as a plain GGUF architecture. Use "auto" for such drafts.
+        target = kwargs.get("target_model_config", args[0] if args else None)
+        separate_draft = (
+            target is not None
+            and getattr(target, "config_format", None) == "gguf"
+            and isinstance(configured_model, str)
+            and not _is_gguf_reference(configured_model)
+        )
+        if separate_draft:
+            target.config_format = "auto"
+        try:
+            config = original_create_speculative_config(self, *args, **kwargs)
+        finally:
+            if separate_draft:
+                target.config_format = "gguf"
+        if separate_draft and config is not None and config.draft_load_config is None:
+            # Otherwise the draft inherits load_format="gguf" and the GGUF loader.
+            from vllm.config import LoadConfig
+
+            config.draft_load_config = LoadConfig(
+                load_format="auto", download_dir=self.download_dir
+            )
         gguf_model = self.model_weights
         if (
             config is not None
@@ -127,8 +150,94 @@ def _register_omni_diffusion_quantization() -> None:
     register_quantization_override("gguf", lambda **kw: DiffusionGGUFConfig(**kw))
 
 
+def _register_pq2_compile_factors() -> None:
+    # AOT loading happens before Dynamo can check tensor-attribute guards.
+    # Layout changes the custom-op arguments, so it must enter the vLLM cache
+    # key, rather than relying on a parameter attribute alone.
+    import vllm.envs as envs
+
+    from . import attention
+    from .quantization import linear
+    from .triton import pq2_int_gemv, pq2_small_mmq, prism
+
+    envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
+        linear._EXPERIMENTAL_PREPARED_PQ2
+    )
+    envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
+    envs.environment_variables["GGUF_PQ2_MMQ"] = lambda: prism._EXPERIMENTAL_MMQ
+    envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
+        "q8-groups-m128-byte32-v3"
+    )
+
+    envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
+        attention._SINGLE_ATTN_BACKEND
+    )
+    envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_SEGMENTS"] = lambda: (
+        attention._SINGLE_ATTN_SEGMENTS
+    )
+    envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_VERSION"] = lambda: (
+        attention._SINGLE_ATTN_VERSION
+    )
+    envs.environment_variables["GGUF_PQ2_VERIFY_ATTN"] = lambda: attention._VERIFY_ATTN
+    envs.environment_variables["GGUF_PQ2_VERIFY_ATTN_VERSION"] = lambda: (
+        attention._VERIFY_ATTN_VERSION
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_ATTN"] = lambda: attention._INT8_KV_ATTN
+    envs.environment_variables["GGUF_PQ2_INT8_KV_INT_QK"] = lambda: (
+        attention._INT8_KV_INT_QK
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_SEGMENTS"] = lambda: (
+        attention._INT8_KV_SEGMENTS
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_VERSION"] = lambda: (
+        attention._INT8_KV_VERSION
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL"] = lambda: (
+        attention._INT8_KV_PREFILL
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_RANGE"] = lambda: (
+        attention._INT8_KV_PREFILL_RANGE
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_VERSION"] = lambda: (
+        attention._INT8_KV_PREFILL_VERSION
+    )
+
+    # Record resolved import-time choices, including defaults, in AOT cache keys.
+    envs.environment_variables["GGUF_PQ2_INT_GEMV"] = lambda: (
+        prism._EXPERIMENTAL_INT_GEMV
+    )
+    envs.environment_variables["GGUF_PQ2_INT_OUTPUT"] = lambda: (
+        prism._EXPERIMENTAL_INT_OUTPUT
+    )
+    envs.environment_variables["GGUF_PQ2_BATCH8_CHAINED"] = lambda: (
+        pq2_int_gemv._BATCH8_CHAINED
+    )
+    envs.environment_variables["GGUF_PQ2_SINGLE_GEMV"] = lambda: (
+        pq2_int_gemv._SINGLE_GEMV
+    )
+    envs.environment_variables["GGUF_PQ2_SMALL_FLOAT_OUTPUT"] = lambda: (
+        prism._SMALL_FLOAT_OUTPUT
+    )
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ"] = lambda: (
+        pq2_small_mmq._SMALL_MMQ
+    )
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
+        pq2_small_mmq._SMALL_MMQ_OUTPUT
+    )
+    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_VERSION"] = lambda: (
+        pq2_small_mmq._VERSION
+    )
+    envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: (
+        "prmt-v2-tiles-batch8-chained-v5"
+    )
+
+
 def register() -> None:
     """Register the out-of-tree GGUF integration."""
+    _register_pq2_compile_factors()
+    from .attention import install_single_decode_attention
+
+    install_single_decode_attention()
     register_quantization_config("gguf")(GGUFConfig)
     _register_omni_diffusion_quantization()
 

@@ -18,6 +18,8 @@ Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
 Tensor ggml_moe_a8_vec(Tensor X, Tensor W, Tensor topk_ids, int64_t top_k,
                        int64_t type, int64_t row, int64_t tokens);
 int64_t ggml_moe_get_block_size(int64_t type);
+void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y,
+                   int64_t warps, int64_t unroll);
 
 STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
@@ -38,6 +40,9 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens) -> Tensor");
   ops.def("ggml_moe_get_block_size(int type) -> int");
+  ops.def(
+      "pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
+      "Tensor(a!) y, int warps, int unroll) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
@@ -46,6 +51,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
+  ops.impl("pq2_mma_small", TORCH_BOX(&pq2_mma_small));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CompositeExplicitAutograd, ops) {
