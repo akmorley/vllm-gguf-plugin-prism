@@ -101,21 +101,44 @@ Tensor ggml_dequantize(Tensor W,  // quant weight
   return DW;
 }
 
-Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
-                           Tensor X,  // input
-                           int64_t type, int64_t row) {
+Tensor ggml_quantize_q8_1(Tensor X) {
+  const int64_t col = X.sizes()[1];
+  const int64_t vecs = X.sizes()[0];
+  const int64_t padded = (col + 512 - 1) / 512 * 512;
+  const int32_t device_idx = X.get_device_index();
+  const DeviceGuard device_guard(device_idx);
+  Tensor quant_X = torch::stable::new_empty(
+      X, {vecs, padded / 32 * 9}, ScalarType::Int);
+  cudaStream_t stream = get_current_cuda_stream(device_idx);
+  VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_quantize_q8_1", [&] {
+    quantize_row_q8_1_cuda((scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(),
+                           col, vecs, stream);
+  });
+  return quant_X;
+}
+
+static Tensor ggml_mul_mat_vec_a8_impl(Tensor W,  // quant weight
+                                       Tensor X,  // input
+                                       Tensor quant_X,
+                                       bool has_quant_X,
+                                       int64_t type, int64_t row) {
   int64_t col = X.sizes()[1];
   int64_t vecs = X.sizes()[0];
   const int64_t padded = (col + 512 - 1) / 512 * 512;
   const int32_t device_idx = X.get_device_index();
   const DeviceGuard device_guard(device_idx);
-  Tensor Y = torch::stable::new_zeros(W, {vecs, row}, X.scalar_type());
+  // Every MMVQ launch writes all vecs x row outputs, so no zero fill is needed.
+  Tensor Y = torch::stable::new_empty(W, {vecs, row}, X.scalar_type());
   cudaStream_t stream = get_current_cuda_stream(device_idx);
-  Tensor quant_X =
-      torch::stable::new_empty(W, {vecs, padded / 32 * 9}, ScalarType::Int);
+  if (!has_quant_X) {
+    quant_X = torch::stable::new_empty(W, {vecs, padded / 32 * 9},
+                                       ScalarType::Int);
+  }
   VLLM_DISPATCH_FLOATING_TYPES(X.scalar_type(), "ggml_mul_mat_vec_a8", [&] {
-    quantize_row_q8_1_cuda<scalar_t>(
-        (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    if (!has_quant_X) {
+      quantize_row_q8_1_cuda<scalar_t>(
+          (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, vecs, stream);
+    }
     switch (type) {
       case 2:
         mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
@@ -215,6 +238,15 @@ Tensor ggml_mul_mat_vec_a8(Tensor W,  // quant weight
     }
   });
   return Y;
+}
+
+Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row) {
+  return ggml_mul_mat_vec_a8_impl(W, X, X, false, type, row);
+}
+
+Tensor ggml_mul_mat_vec_a8_prequantized(Tensor W, Tensor X, Tensor quant_X,
+                                        int64_t type, int64_t row) {
+  return ggml_mul_mat_vec_a8_impl(W, X, quant_X, true, type, row);
 }
 
 Tensor ggml_mul_mat_a8(Tensor W,  // quant weight

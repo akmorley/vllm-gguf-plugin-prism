@@ -134,3 +134,23 @@ def test_tied_head_keeps_forward_method_and_shares_parameters():
     assert head.weight is embedding.weight
     assert head.weight_type is embedding.weight_type
     assert head.quant_method.hadamard_runtime_config is runtime
+
+
+@pytest.mark.parametrize("shape", [(5, 8), (3, 2, 8), (2, 3, 1, 8)])
+def test_linear_keeps_leading_dimensions(shape):
+    """Vision towers call linear layers with [seq, batch, hidden]; GGUF kernels are 2-D only."""
+    method = GGUFLinearMethod(None)
+    weight = torch.randn(6, 8)
+    layer = SimpleNamespace(
+        weight=SimpleNamespace(shard_id=[]), weight_type=SimpleNamespace(weight_type=0)
+    )
+    x = torch.randn(*shape)
+
+    def matmul(x, *args, **kwargs):
+        assert x.dim() == 2
+        return x @ weight.T
+
+    with patch("vllm_gguf_plugin.quantization.fused_mul_mat_gguf", side_effect=matmul):
+        out = method.apply(layer, x, bias=torch.ones(6))
+    assert out.shape == (*shape[:-1], 6)
+    torch.testing.assert_close(out, x @ weight.T + 1)
