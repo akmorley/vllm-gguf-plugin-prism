@@ -179,11 +179,36 @@ if (
 
 
 def ggml_dequantize(
-    W: torch.Tensor, quant_type: int, m: int, n: int, dtype: torch.dtype | None
+    W: torch.Tensor,
+    quant_type: int,
+    m: int,
+    n: int,
+    dtype: torch.dtype | None,
 ) -> torch.Tensor:
-    if _cuda_kernel_available("ggml_dequantize", quant_type):
-        return torch.ops._C_gguf.ggml_dequantize(W, quant_type, m, n, dtype)
-    return ggml_dequantize_triton(W, quant_type, m, n, dtype)
+    use_cuda = (
+        quant_type == 142
+        or _cuda_kernel_available(
+            "ggml_dequantize",
+            quant_type,
+        )
+    )
+
+    if use_cuda:
+        return torch.ops._C_gguf.ggml_dequantize(
+            W,
+            quant_type,
+            m,
+            n,
+            dtype,
+        )
+
+    return ggml_dequantize_triton(
+        W,
+        quant_type,
+        m,
+        n,
+        dtype,
+    )
 
 
 def ggml_mul_mat_vec_a8(

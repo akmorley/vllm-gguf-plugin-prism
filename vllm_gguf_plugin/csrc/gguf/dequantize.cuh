@@ -77,6 +77,37 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v = __hmul2(v, {d, d});
 }
 
+
+static __device__ __forceinline__ void dequantize_pq2_0(const void * vx, const int ib, const int iqs, dfloat2 & v) {
+
+    const block_pq2_0 * x =
+        (const block_pq2_0 *) vx;
+
+    const dfloat d = x[ib].d;
+
+    const int byte_index_0 = iqs / 4;
+    const int bit_offset_0  = (iqs % 4) * 2;
+
+    const int byte_index_1 = (iqs + 1) / 4;
+    const int bit_offset_1  = ((iqs + 1) % 4) * 2;
+
+    const int c0 =
+        (x[ib].qs[byte_index_0] >> bit_offset_0) & 0x3;
+
+    const int c1 =
+        (x[ib].qs[byte_index_1] >> bit_offset_1) & 0x3;
+
+    v.x = __int2half_rn(c0 - 1);
+    v.y = __int2half_rn(c1 - 1);
+
+    v = __hmul2(v, {d, d});
+
+}
+
+
+
+
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
     const int64_t i = 2*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
@@ -565,7 +596,10 @@ static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
             return dequantize_row_iq4_xs_cuda;
         case 29:
             return dequantize_row_iq1_m_cuda;
-        default:
+        case 142:
+    	    return dequantize_block_cuda<QK_PQ2_0,QR_PQ2_0,dequantize_pq2_0>;	
+	default:
             return nullptr;
     }
 }
+
