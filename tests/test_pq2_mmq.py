@@ -79,30 +79,3 @@ def test_mmq_rejects_unsupported_activation_group(group):
     w = torch.zeros((1, 34), device="cuda", dtype=torch.uint8)
     with pytest.raises(ValueError, match="activation group"):
         pq2_mmq(x, w, activation_group=group)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("m", [64, 129, 333, 1000])
-@pytest.mark.parametrize("n,k", [(512, 5120), (5120, 6144), (200, 1280)])
-def test_tensor_core_prefill_matches_triton_kernel(monkeypatch, dtype, m, n, k):
-    """The hand-written INT8 MMA prefill kernel is bit-exact with the Triton MMQ kernel."""
-    from vllm_gguf_plugin.triton import pq2_mmq as module
-    from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
-
-    if torch.cuda.get_device_capability() != (8, 6) or not module._mma_prefill_available():
-        pytest.skip("SM86 build with pq2_mma_prefill required")
-    torch.manual_seed(31 + m)
-    raw = torch.randint(0, 256, (n, k // 128, 34), dtype=torch.uint8, device="cuda")
-    scales = (torch.rand(n, k // 128, device="cuda") * 0.04 + 0.002).half()
-    raw[:, :, :2] = scales.view(torch.uint8).reshape(n, k // 128, 2)
-    w = prepare_pq2_layout(raw.reshape(n, -1))
-    x = (torch.randn(m, k, device="cuda") * torch.rand(1, k, device="cuda") * 4).to(dtype)
-    monkeypatch.setattr(module, "_MMA_PREFILL", False)
-    expected = module.pq2_mmq(x, w, prepared=True)
-    monkeypatch.setattr(module, "_MMA_PREFILL", True)
-    calls = []
-    real = module._mma_prefill
-    monkeypatch.setattr(module, "_mma_prefill", lambda *a: calls.append(1) or real(*a))
-    actual = module.pq2_mmq(x, w, prepared=True)
-    assert calls == [1]
-    assert torch.equal(actual, expected)

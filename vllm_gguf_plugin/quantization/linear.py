@@ -31,34 +31,13 @@ from .params import (
 )
 from .utils import (
     DEQUANT_TYPES,
+    IMATRIX_QUANT_TYPES,
     MMQ_QUANT_TYPES,
     MMVQ_QUANT_TYPES,
     UNQUANTIZED_TYPES,
 )
 
 _EXPERIMENTAL_PREPARED_PQ2 = os.environ.get("GGUF_PQ2_PREPARED", "0") == "1"
-_DEQUANT_GEMM_MIN_BATCH = int(os.environ.get("GGUF_DEQUANT_GEMM_MIN_BATCH", "32"))
-_DEQUANT_GEMM_CHUNK_ELEMS = 64 * 1024 * 1024
-# MMVQ reads each weight block once for up to 16 vectors (more fall back to a per-vector
-# kernel). Through 16 rows it beats MMQ by 1.3-2.9x on Q5_K/Q6_K shapes (RTX 3090), which keeps
-# concurrent speculative verification (e.g. 4 requests x 3 tokens) off MMQ.
-_MMVQ_MAX_ROWS = 16
-
-
-def _dequant_gemm(
-    x: torch.Tensor, weight: torch.Tensor, weight_type: int
-) -> torch.Tensor:
-    block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
-    rows, cols = weight.shape[0], weight.shape[1] // type_size * block_size
-    chunk = max(1, _DEQUANT_GEMM_CHUNK_ELEMS // cols)
-    if rows <= chunk:
-        return x @ ops.ggml_dequantize(weight, weight_type, rows, cols, x.dtype).T
-    y = torch.empty(x.shape[0], rows, dtype=x.dtype, device=x.device)
-    for start in range(0, rows, chunk):
-        part = weight[start : start + chunk]
-        w = ops.ggml_dequantize(part, weight_type, part.shape[0], cols, x.dtype)
-        y[:, start : start + part.shape[0]] = x @ w.T
-    return y
 
 def debug_plain_rmsnorm(
     x: torch.Tensor,
@@ -76,22 +55,16 @@ def debug_plain_rmsnorm(
 
 
 
-def gguf_shard_weight(weight: torch.Tensor, shard: str) -> torch.Tensor:
-    """Contiguous packed bytes of one shard of a merged GGUF weight."""
-    views = getattr(weight, "gguf_shard_views", None)
-    if views is not None:
-        return views[shard]
-    start, end, size = weight.shard_offset_map[shard]
-    return weight[start:end, :size].contiguous()
-
-
 def _fused_mul_mat_gguf(
     x: torch.Tensor, weight: torch.Tensor, weight_type: int,
     pq2_prepared: bool = False,
 ) -> torch.Tensor:
     if pq2_prepared and (weight_type != WeightType.PQ2_0 or not x.is_cuda):
         raise ValueError("Prepared weights require CUDA PQ2 execution")
-    mmvq_safe = _MMVQ_MAX_ROWS
+    if weight_type in IMATRIX_QUANT_TYPES:
+        mmvq_safe = 8 if weight.shape[0] > 5120 else 16
+    else:
+        mmvq_safe = 2 if weight.shape[0] > 5120 else 6
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     if weight_type == WeightType.PQ2_0 and x.is_cuda:
@@ -101,11 +74,6 @@ def _fused_mul_mat_gguf(
         return x @ weight.T
     if x.shape[0] <= mmvq_safe and weight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(weight, x, weight_type, weight.shape[0])
-    elif x.shape[0] >= _DEQUANT_GEMM_MIN_BATCH and weight_type in DEQUANT_TYPES:
-        # The MMQ kernels use dp4a, not tensor cores: from about 32 rows (3090 Ti, Q5_K/Q6_K)
-        # dequantising to the activation dtype for a cuBLAS GEMM is faster (9-13x at 2048
-        # rows) and exact. Large weights go in row chunks to bound the temporary.
-        y = _dequant_gemm(x, weight, weight_type)
     elif weight_type in MMQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_a8(weight, x, weight_type, weight.shape[0])
     elif weight_type in DEQUANT_TYPES:
@@ -128,20 +96,6 @@ def _fused_mul_mat_gguf_fake(
     return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
 
 
-def _fused_mul_mat_gguf_prequantized(
-    x: torch.Tensor, quant_x: torch.Tensor, weight: torch.Tensor, weight_type: int
-) -> torch.Tensor:
-    return ops.ggml_mul_mat_vec_a8_prequantized(
-        weight, x, quant_x, weight_type, weight.shape[0]
-    )
-
-
-def _fused_mul_mat_gguf_prequantized_fake(
-    x: torch.Tensor, quant_x: torch.Tensor, weight: torch.Tensor, weight_type: int
-) -> torch.Tensor:
-    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
-
-
 try:
     direct_register_custom_op(
         op_name="_fused_mul_mat_gguf",
@@ -149,12 +103,6 @@ try:
         fake_impl=_fused_mul_mat_gguf_fake,
     )
     fused_mul_mat_gguf = torch.ops.vllm._fused_mul_mat_gguf
-    direct_register_custom_op(
-        op_name="_fused_mul_mat_gguf_prequantized",
-        op_func=_fused_mul_mat_gguf_prequantized,
-        fake_impl=_fused_mul_mat_gguf_prequantized_fake,
-    )
-    fused_mul_mat_gguf_prequantized = torch.ops.vllm._fused_mul_mat_gguf_prequantized
 except AttributeError as error:
     raise error
 
@@ -291,41 +239,18 @@ class GGUFLinearMethod(LinearMethodBase):
             dtype = next(iter(dtype))
             padded_side = max(x.size(1) for x in data_container)
             concat_side = sum(x.size(0) for x in data_container)
-            ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
-            # Shards of different GGUF types (e.g. Q6_K and Q5_K rows of a GDN in_proj)
-            # have different row widths. Padding them into one [rows, max_width] tensor
-            # makes every narrower shard strided, and apply() would copy it on each
-            # call (7 MB per Qwen3.5-4B GDN layer per token). Store each shard
-            # contiguously in a flat buffer instead and run it through a view.
-            flat = len({x.size(1) for x in data_container}) > 1
-            if flat:
-                padded_data = torch.empty(
-                    sum(x.numel() for x in data_container),
-                    dtype=dtype,
-                    device=weight.device,
-                )
-            else:
-                padded_data = torch.zeros(
-                    (concat_side, padded_side), dtype=dtype, device=weight.device
-                )
+            padded_data = torch.zeros(
+                (concat_side, padded_side), dtype=dtype, device=weight.device
+            )
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            shard_views = dict[str, torch.Tensor]()
+            ordered_shard_ids = _gguf_ordered_shard_ids(shard_id)
             current_offset = 0
-            flat_offset = 0
             for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
-                data = data_container[id_in_container]
                 start = current_offset
-                end = start + data.size(0)
-                size = data.size(1)
-                if flat:
-                    view = padded_data[flat_offset : flat_offset + data.numel()]
-                    view = view.view(data.size(0), size)
-                    view.copy_(data)
-                    shard_views[idx] = view
-                    flat_offset += data.numel()
-                else:
-                    padded_data[start:end, :size] = data
+                end = start + data_container[id_in_container].size(0)
+                size = data_container[id_in_container].size(1)
+                padded_data[start:end, :size] = data_container[id_in_container]
                 shard_offset_map[idx] = (start, end, size)
                 current_offset = end
             padded_param = GGUFWeightParameter(
@@ -341,8 +266,6 @@ class GGUFLinearMethod(LinearMethodBase):
             if hasattr(weight, "ignore_warning"):
                 padded_param.ignore_warning = weight.ignore_warning
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
-            if flat:
-                set_weight_attrs(padded_param, {"gguf_shard_views": shard_views})
             weight.data_container.clear()
             weight.shard_id.clear()
             weight.shard_id_map.clear()
@@ -357,11 +280,6 @@ class GGUFLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from . import fused_mul_mat_gguf as fused_mul_mat_gguf_op
-
-        # The GGUF kernels take 2-D activations; vision towers pass [seq, batch, hidden].
-        leading = x.shape[:-1]
-        if x.dim() != 2:
-            x = x.reshape(-1, x.shape[-1])
 
         hadamard_runtime = self.hadamard_runtime_config
         skip_input_layout = (
@@ -406,17 +324,12 @@ class GGUFLinearMethod(LinearMethodBase):
 
             else:
                 # Mixed GGUF types: execute each logical shard using
-                # its own type and concatenate the results. Every shard reads
-                # the same x, so on the MMVQ path quantize it to Q8_1 once
-                # (e.g. Qwen3.5 attention q/k/v as Q5_K/Q5_K/Q6_K: 3 -> 1).
+                # its own type and concatenate the results.
                 result = []
-                quant_x = None
-                if x.shape[0] <= _MMVQ_MAX_ROWS and all(
-                    t in MMVQ_QUANT_TYPES for t in shard_weight_types
-                ):
-                    quant_x = ops.ggml_quantize_q8_1(x)
 
                 for idx in shard_id:
+                    start, end, offset = layer.weight.shard_offset_map[idx]
+
                     weight_type = (
                         layer.weight_type.shard_weight_type.get(
                             idx,
@@ -424,16 +337,11 @@ class GGUFLinearMethod(LinearMethodBase):
                         )
                     )
 
-                    if quant_x is not None:
-                        shard_out = fused_mul_mat_gguf_prequantized(
-                            x, quant_x, gguf_shard_weight(weight, idx), weight_type
-                        )
-                    else:
-                        shard_out = fused_mul_mat_gguf_op(
-                            x,
-                            gguf_shard_weight(weight, idx),
-                            weight_type,
-                        )
+                    shard_out = fused_mul_mat_gguf_op(
+                        x,
+                        weight[start:end, :offset].contiguous(),
+                        weight_type,
+                    )
 
                     result.append(shard_out)
 
@@ -454,6 +362,4 @@ class GGUFLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
 
-        if len(leading) != 1:
-            out = out.reshape(*leading, out.shape[-1])
         return out

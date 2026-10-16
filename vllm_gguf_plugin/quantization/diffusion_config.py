@@ -14,7 +14,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 
 from .. import ops
 from .config import GGUFConfig
-from .linear import GGUFLinearMethod, gguf_shard_weight
+from .linear import GGUFLinearMethod
 from .utils import UNQUANTIZED_TYPES, is_layer_skipped_gguf
 
 
@@ -59,11 +59,14 @@ class DiffusionGGUFLinearMethod(GGUFLinearMethod):
                 return out
             result = []
             for idx in shard_id:
+                start, end, offset = layer.weight.shard_offset_map[idx]
                 weight_type = layer.weight_type.shard_weight_type.get(
                     idx, fallback_wtype
                 )
                 result.append(
-                    dequant_gemm_gguf(x, gguf_shard_weight(weight, idx), weight_type)
+                    dequant_gemm_gguf(
+                        x, weight[start:end, :offset].contiguous(), weight_type
+                    )
                 )
             out = torch.cat(result, axis=1)
         else:

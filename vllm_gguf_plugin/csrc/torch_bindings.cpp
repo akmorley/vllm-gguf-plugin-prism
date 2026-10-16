@@ -11,9 +11,6 @@ using torch::stable::Tensor;
 Tensor ggml_dequantize(Tensor W, int64_t type, int64_t m, int64_t n,
                        std::optional<ScalarType> dtype);
 Tensor ggml_mul_mat_vec_a8(Tensor W, Tensor X, int64_t type, int64_t row);
-Tensor ggml_quantize_q8_1(Tensor X);
-Tensor ggml_mul_mat_vec_a8_prequantized(Tensor W, Tensor X, Tensor quant_X,
-                                        int64_t type, int64_t row);
 Tensor ggml_mul_mat_a8(Tensor W, Tensor X, int64_t type, int64_t row);
 Tensor ggml_moe_a8(Tensor X, Tensor W, Tensor sorted_token_ids,
                    Tensor expert_ids, Tensor num_tokens_post_padded,
@@ -22,12 +19,7 @@ Tensor ggml_moe_a8_vec(Tensor X, Tensor W, Tensor topk_ids, int64_t top_k,
                        int64_t type, int64_t row, int64_t tokens);
 int64_t ggml_moe_get_block_size(int64_t type);
 void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y,
-                   int64_t warps, int64_t unroll, int64_t rt);
-void pq2_mma_prefill(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y,
-                     int64_t cfg);
-void pq2_mma_ring(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, Tensor partial,
-                  Tensor counters, int64_t cfg, int64_t split);
-void pq2_gemv_m1(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, int64_t cfg);
+                   int64_t warps, int64_t unroll);
 
 STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
@@ -36,9 +28,6 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
       "-> Tensor");
-  ops.def("ggml_quantize_q8_1(Tensor X) -> Tensor");
-  ops.def("ggml_mul_mat_vec_a8_prequantized(Tensor W, Tensor X, Tensor quant_X, "
-          "int type, SymInt row) -> Tensor");
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
   ops.def(
@@ -53,32 +42,16 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def("ggml_moe_get_block_size(int type) -> int");
   ops.def(
       "pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
-      "Tensor(a!) y, int warps, int unroll, int rt=1) -> ()");
-  ops.def(
-      "pq2_mma_prefill(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
-      "Tensor(a!) y, int cfg) -> ()");
-  ops.def(
-      "pq2_mma_ring(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
-      "Tensor(a!) y, Tensor(b!) partial, Tensor(c!) counters, int cfg, "
-      "int split) -> ()");
-  ops.def(
-      "pq2_gemv_m1(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
-      "Tensor(a!) y, int cfg) -> ()");
+      "Tensor(a!) y, int warps, int unroll) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
-  ops.impl("ggml_quantize_q8_1", TORCH_BOX(&ggml_quantize_q8_1));
-  ops.impl("ggml_mul_mat_vec_a8_prequantized",
-           TORCH_BOX(&ggml_mul_mat_vec_a8_prequantized));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
   ops.impl("pq2_mma_small", TORCH_BOX(&pq2_mma_small));
-  ops.impl("pq2_mma_prefill", TORCH_BOX(&pq2_mma_prefill));
-  ops.impl("pq2_mma_ring", TORCH_BOX(&pq2_mma_ring));
-  ops.impl("pq2_gemv_m1", TORCH_BOX(&pq2_gemv_m1));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CompositeExplicitAutograd, ops) {

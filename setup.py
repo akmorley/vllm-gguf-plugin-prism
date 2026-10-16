@@ -49,9 +49,6 @@ if _should_build_extension():
                     "vllm_gguf_plugin/csrc/torch_bindings.cpp",
                     "vllm_gguf_plugin/csrc/gguf/gguf_kernel.cu",
                     "vllm_gguf_plugin/csrc/pq2/pq2_mma_small.cu",
-                    "vllm_gguf_plugin/csrc/pq2/pq2_mma_prefill.cu",
-                    "vllm_gguf_plugin/csrc/pq2/pq2_mma_ring.cu",
-                    "vllm_gguf_plugin/csrc/pq2/pq2_gemv_m1.cu",
                 ],
                 include_dirs=[
                     "vllm_gguf_plugin/csrc",

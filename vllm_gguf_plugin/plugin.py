@@ -158,7 +158,7 @@ def _register_pq2_compile_factors() -> None:
 
     from . import attention
     from .quantization import linear
-    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism
+    from .triton import pq2_int_gemv, pq2_small_mmq, prism
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -166,26 +166,8 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_LAYOUT_VERSION"] = lambda: "planes-v1"
     envs.environment_variables["GGUF_PQ2_MMQ"] = lambda: prism._EXPERIMENTAL_MMQ
     envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
-        "q8-groups-m128-byte32-v5-mma-prefill"
+        "q8-groups-m128-byte32-v3"
     )
-
-    # The PQ2 kernel switches (see triton/pq2_config.py): the selected set, its version, and each path's
-    # resolved on/off state all enter the compile identity.
-    envs.environment_variables["GGUF_PQ2_KERNELS"] = lambda: pq2_config.KERNELS
-    envs.environment_variables["GGUF_PQ2_KERNEL_VERSION"] = lambda: pq2_config.KERNEL_VERSION
-    for env_name, module, attr in (
-        ("GGUF_PQ2_MMQ_TUNED_TILES", pq2_mmq, "_TUNED_TILES"),
-        ("GGUF_PQ2_PREFILL_ROWS", pq2_mmq, "_QUANT_ROWS"),
-        ("GGUF_PQ2_MMA_PREFILL", pq2_mmq, "_MMA_PREFILL"),
-        ("GGUF_PQ2_MMQ_OUTPUT", prism, "_MMQ_OUTPUT"),
-        ("GGUF_PQ2_SMALL_MMQ_RT", pq2_small_mmq, "_CUDA_RT"),
-        ("GGUF_PQ2_SMALL_MMQ_RING", pq2_small_mmq, "_RING"),
-        ("GGUF_PQ2_SMALL_MMQ_RING_EXACT", pq2_small_mmq, "_RING_EXACT_ONLY"),
-        ("GGUF_PQ2_M1_CUDA", pq2_int_gemv, "_M1_CUDA"),
-    ):
-        envs.environment_variables[env_name] = (
-            lambda module=module, attr=attr: getattr(module, attr)
-        )
 
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
         attention._SINGLE_ATTN_BACKEND
@@ -199,25 +181,6 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_VERIFY_ATTN"] = lambda: attention._VERIFY_ATTN
     envs.environment_variables["GGUF_PQ2_VERIFY_ATTN_VERSION"] = lambda: (
         attention._VERIFY_ATTN_VERSION
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_ATTN"] = lambda: attention._INT8_KV_ATTN
-    envs.environment_variables["GGUF_PQ2_INT8_KV_INT_QK"] = lambda: (
-        attention._INT8_KV_INT_QK
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_SEGMENTS"] = lambda: (
-        attention._INT8_KV_SEGMENTS
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_VERSION"] = lambda: (
-        attention._INT8_KV_VERSION
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL"] = lambda: (
-        attention._INT8_KV_PREFILL
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_RANGE"] = lambda: (
-        attention._INT8_KV_PREFILL_RANGE
-    )
-    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_VERSION"] = lambda: (
-        attention._INT8_KV_PREFILL_VERSION
     )
 
     # Record resolved import-time choices, including defaults, in AOT cache keys.
@@ -246,7 +209,7 @@ def _register_pq2_compile_factors() -> None:
         pq2_small_mmq._VERSION
     )
     envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: (
-        "prmt-v2-tiles-batch8-chained-v5-m1cuda"
+        "prmt-v2-tiles-batch8-chained-v5"
     )
 
 

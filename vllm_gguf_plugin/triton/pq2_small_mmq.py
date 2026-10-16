@@ -16,9 +16,6 @@ import torch
 import triton
 import triton.language as tl
 
-from . import pq2_config as _config
-from . import pq2_tables as _tables
-
 # M = 2..64 (speculative verification, small batches). Default on; GGUF_PQ2_SMALL_MMQ=0 disables.
 _SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "1") == "1"
 # Also route the (5120, 6144) output projections (M = 2..8) through the INT8 CUDA kernel.
@@ -27,9 +24,7 @@ _SMALL_MMQ = os.environ.get("GGUF_PQ2_SMALL_MMQ", "1") == "1"
 # no difference: pq2-dflash-quality-20261007); GGUF_PQ2_SMALL_MMQ_OUTPUT=0 disables.
 _SMALL_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_MMQ_OUTPUT", "1") == "1"
 OUTPUT_CUDA = (2, 8)  # (warps, groups in flight), RTX 3090 Ti microbenchmark, M = 2..8
-# Register-tiled CUDA variants (row tiles per warp > 1); GGUF_PQ2_SMALL_MMQ_RT=0 restores one tile per warp.
-_CUDA_RT = _config.flag("GGUF_PQ2_SMALL_MMQ_RT", "exact_class")
-_VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v3-rt-ring"
+_VERSION = "masked-planes-splitk-v2-m2-16+cuda-mma-v1"
 _MAX_M = 64
 _CALLS = 0  # Python-side launches (warmup and graph capture); replay does not re-enter.
 # M -> (N, K) -> (rows per program, groups per iteration, warps, pipeline stages, K splits).
@@ -173,96 +168,12 @@ CUDA_BY_M = {
 }
 
 
-# (warps, groups in flight, row tiles per warp): register-tiled variants of the CUDA kernel. Each warp
-# handles RT 16-row tiles per group, loading the group's activation fragments once instead of RT
-# times; per-element arithmetic (and so the output) is identical to RT = 1. Selected on RTX 3090 Ti
-# (pq2-batched-decode-longctx-20261015); only entries >= 4% faster than the previous path are listed.
-# Not listed: 5120 x 17408 and 5120 x 6144 (320 row tiles: too little parallelism to gain).
-CUDA_RT_BY_M = _tables.SM86.rt_by_m  # per-architecture tables: pq2_tables.py
-
-
-# cp.async-ring CUDA kernel (csrc/pq2/pq2_mma_ring.cu): weights and activations are staged in shared memory so every
-# DRAM request is a >= 64 B row segment. The direct-fragment kernel above issues one 32 B piece per row per group,
-# which limits it on the narrow projections (N = 5120) and at M >= 6 for the wide ones.
-# M -> (N, K) -> (cfg, split). cfg selects the CTA tile in pq2_mma_ring.cu; split > 1 is split-K with a fused
-# fixed-order reduction (deterministic). Entries in RING_EXACT sum in the same order as the path they replace, so the
-# output is bit-identical; the rest differ at the FP32 rounding level (relative RMS ~1e-4) and are deterministic.
-# Selected on RTX 3090 Ti against the paths above and confirmed on the captured real batch-8 decode data (257 projections:
-# 13.70 -> 12.43 ms per step); in_proj and gate/up showed no gain on real data and stay on the direct-fragment kernel.
-# (pq2-decode-kernel-design-20261015)
-RING_BY_M = _tables.SM86.ring_by_m
-RING_EXACT = _tables.SM86.ring_exact
-_RING = _config.flag("GGUF_PQ2_SMALL_MMQ_RING", "exact_class")
-# GGUF_PQ2_SMALL_MMQ_RING_EXACT=1 keeps only the entries in RING_EXACT (bit-identical outputs); the split-K `down`
-# entries (the largest gain, FP32 rounding-level reordering) are then left on the previous path.
-_RING_EXACT_ONLY = _config.flag("GGUF_PQ2_SMALL_MMQ_RING_EXACT", "exact_only_ring")
-_RING_WS = {}
-
-
-def _ring_available():
-    return (_cuda_available() and hasattr(torch.ops._C_gguf, "pq2_mma_ring"))
-
-
-def ring_for(m, n, k):
-    """(cfg, split) for the ring kernel, or None."""
-    if not _RING or not RING_BY_M or not _ring_available():
-        return None
-    if _RING_EXACT_ONLY and (m, n, k) not in RING_EXACT:
-        return None
-    return RING_BY_M.get(m, {}).get((n, k))
-
-
-def _ring_workspace(device, allocate=True):
-    """Persistent split-K scratch: FP32 partials and zero-initialised self-resetting tile counters.
-
-    One workspace per device, shared by every split-K launch, so all ring launches on a device must be ordered on one
-    stream (true for the engine's forward pass and for CUDA-graph replay; two split-K launches overlapping on different
-    streams would corrupt each other). The counters must be zero on entry, so the workspace is never allocated while a
-    CUDA graph is being captured (the zero fill would be captured instead of executed, and the memory would belong to
-    the graph's private pool): it is created on first eager use, which the engine's warm-up always precedes capture
-    with. Returns None when it does not exist and cannot be created now.
-    """
-    ws = _RING_WS.get(device)
-    if ws is None and allocate and not torch.cuda.is_current_stream_capturing():
-        partial = max((sp * m * n for m, t in RING_BY_M.items() for (n, _k), (_c, sp) in t.items() if sp > 1),
-                      default=1)
-        # One counter per row block of the narrowest tile (16 rows); the kernel indexes them by blockIdx.x.
-        blocks = max((-(-n // 16) for t in RING_BY_M.values() for (n, _k) in t), default=1)
-        ws = (torch.empty(partial, dtype=torch.float32, device=device),
-              torch.zeros(max(blocks, 1), dtype=torch.int32, device=device))
-        _RING_WS[device] = ws
-    return ws
-
-
-def _pq2_mma_ring(x, weight, cfg, split):
-    from .pq2_mmq import _quantize_prefill
-
-    m, k = x.shape
-    n = weight.shape[0]
-    x = x.contiguous()
-    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
-    s = torch.empty((m, k // 128), dtype=torch.float32, device=x.device)
-    t = torch.empty((m, k // 128), dtype=torch.int32, device=x.device)
-    groups = m * (k // 128)
-    _quantize_prefill[(triton.cdiv(groups, 8),)](x, q, s, t, groups, 8, num_warps=4)
-    y = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    partial, counters = _ring_workspace(x.device)  # existence checked by the caller
-    torch.ops._C_gguf.pq2_mma_ring(q, s, t, weight, y, partial, counters, cfg, split)
-    return y
-
-
 def cuda_for(m, n, k):
-    """(warps, groups in flight, row tiles per warp) for the CUDA MMA kernel, or None."""
     if not _cuda_available():
         return None
-    if _CUDA_RT:
-        rt = CUDA_RT_BY_M.get(m, {}).get((n, k))
-        if rt is not None:
-            return rt
     if _SMALL_MMQ_OUTPUT and (n, k) == (5120, 6144) and 2 <= m <= 8:
-        return (*OUTPUT_CUDA, 1)
-    base = CUDA_BY_M.get(m, {}).get((n, k))
-    return None if base is None else (*base, 1)
+        return OUTPUT_CUDA
+    return CUDA_BY_M.get(m, {}).get((n, k))
 
 
 def _cuda_available():
@@ -366,8 +277,7 @@ def eligible(x, weight, prepared):
         enabled
         and x.dtype in (torch.bfloat16, torch.float16)
         and (geometry_for(m, weight.shape[0], x.shape[1]) is not None
-             or cuda_for(m, weight.shape[0], x.shape[1]) is not None
-             or ring_for(m, weight.shape[0], x.shape[1]) is not None)
+             or cuda_for(m, weight.shape[0], x.shape[1]) is not None)
         and torch.cuda.get_device_capability(x.device) == (8, 6)
     )
 
@@ -378,11 +288,6 @@ def pq2_small_mmq(x, weight, geometry=None):
     _CALLS += 1
     m, k = x.shape
     n = weight.shape[0]
-    ring = None if geometry is not None else ring_for(m, n, k)
-    if ring is not None and ring[1] > 1 and _ring_workspace(x.device) is None:
-        ring = None  # first split-K call happens inside graph capture: take the previous path instead
-    if ring is not None:
-        return _pq2_mma_ring(x, weight, *ring)
     cuda = None if geometry is not None else cuda_for(m, n, k)
     if cuda is not None:
         return _pq2_mma_small(x, weight, *cuda)
@@ -409,7 +314,7 @@ def pq2_small_mmq(x, weight, geometry=None):
     return y
 
 
-def _pq2_mma_small(x, weight, warps, unroll, rt=1):
+def _pq2_mma_small(x, weight, warps, unroll):
     m, k = x.shape
     n = weight.shape[0]
     if not 1 <= m <= 16 or k % 128 or weight.shape[1] != k // 128 * 34:
@@ -420,5 +325,5 @@ def _pq2_mma_small(x, weight, warps, unroll, rt=1):
     t = torch.empty((m, k // 128), dtype=torch.int32, device=x.device)
     _quantize_fragments[(m * (k // 128),)](x, q, s, t, k)
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
-    torch.ops._C_gguf.pq2_mma_small(q, s, t, weight, y, warps, unroll, rt)
+    torch.ops._C_gguf.pq2_mma_small(q, s, t, weight, y, warps, unroll)
     return y
