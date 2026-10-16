@@ -47,6 +47,6 @@ def test_mmq_cache_factor(monkeypatch):
     assert hash_factors(envs.compile_factors()) != raw
     assert (
         envs.environment_variables["GGUF_PQ2_MMQ_VERSION"]()
-        == "q8-groups-m128-byte32-v3"
+        == "q8-groups-m128-byte32-v5-mma-prefill"
     )
 

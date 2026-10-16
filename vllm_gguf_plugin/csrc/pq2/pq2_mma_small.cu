@@ -12,6 +12,8 @@
 // per plane. Activations are stored per group in the matching order (see quantize kernel):
 //   position s*32 + L, where logical slot L maps to byte(L) = 8*(L%16/4) + 4*(L/16) + L%4.
 // No shared memory, no barriers; INT32 group sums equal the DP4A kernel's exactly.
+// RT 16-row weight tiles per warp share each group's activation fragments (RT = 1: one tile per warp);
+// per-element arithmetic is identical for every RT.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -30,35 +32,40 @@ template <> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { retur
 template <> __device__ __forceinline__ __half from_float(float v) { return __float2half(v); }
 
 // NT = number of 8-token column tiles (1: M<=8, 2: M<=16). UNROLL groups in flight per warp.
-template <typename T, int NT, int UNROLL>
+// RT = 16-row weight tiles per warp: the activation fragments of each group are loaded once and
+// reused for RT tiles (RT = 1 is the original kernel; per-element arithmetic is identical).
+template <typename T, int NT, int UNROLL, int RT>
 __global__ void __launch_bounds__(128) pq2_mma_small_kernel(
-    const int8_t* __restrict__ q,        // [M, K] plane-ordered
-    const float* __restrict__ xs,        // [M, K/128]
-    const int* __restrict__ qsum,        // [M, K/128]
-    const uint8_t* __restrict__ codes,   // [N, K/4]
-    const __half* __restrict__ wscale,   // [N, K/128]
-    T* __restrict__ y,                   // [M, N]            (split == 1)
-    float* __restrict__ partial,         // [split, M, N]     (split > 1)
-    int M, int N, int K, int split) {
+    const int8_t* __restrict__ q, const float* __restrict__ xs, const int* __restrict__ qsum,
+    const uint8_t* __restrict__ codes, const __half* __restrict__ wscale, T* __restrict__ y,
+    float* __restrict__ partial, int M, int N, int K, int split) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const int gid = lane >> 2, tid = lane & 3;
-  const int row_tile = blockIdx.x * (blockDim.x >> 5) + warp;
-  const int row0 = row_tile * 16 + gid, row1 = row0 + 8;
-  if (row_tile * 16 >= N) return;
+  const int first_tile = (blockIdx.x * (blockDim.x >> 5) + warp) * RT;
+  if (first_tile * 16 >= N) return;
   const int groups = K >> 7;
   const int per = groups / split;
   const int g_begin = blockIdx.y * per, g_end = g_begin + per;
-  const bool ok0 = row0 < N, ok1 = row1 < N;
-  const uint8_t* c0 = codes + (size_t)(ok0 ? row0 : 0) * (K >> 2) + tid * 8;
-  const uint8_t* c1 = codes + (size_t)(ok1 ? row1 : 0) * (K >> 2) + tid * 8;
-
-  float acc[NT][4];
+  int row0[RT], row1[RT];
+  bool ok0[RT], ok1[RT];
+  const uint8_t *c0[RT], *c1[RT];
 #pragma unroll
-  for (int t = 0; t < NT; ++t)
+  for (int r = 0; r < RT; ++r) {
+    row0[r] = (first_tile + r) * 16 + gid;
+    row1[r] = row0[r] + 8;
+    ok0[r] = row0[r] < N;
+    ok1[r] = row1[r] < N;
+    c0[r] = codes + (size_t)(ok0[r] ? row0[r] : 0) * (K >> 2) + tid * 8;
+    c1[r] = codes + (size_t)(ok1[r] ? row1[r] : 0) * (K >> 2) + tid * 8;
+  }
+  float acc[RT][NT][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) acc[t][i] = 0.f;
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+      for (int i = 0; i < 4; ++i) acc[r][t][i] = 0.f;
 
-  // Per-thread activation pointers for its B column in each 8-token tile, and its C tokens.
   const int8_t* qb[NT];
   bool tok_ok[NT], c_ok[NT][2];
 #pragma unroll
@@ -70,19 +77,21 @@ __global__ void __launch_bounds__(128) pq2_mma_small_kernel(
     c_ok[t][1] = t * 8 + tid * 2 + 1 < M;
   }
   for (int g0 = g_begin; g0 < g_end; g0 += UNROLL) {
-    // Phase 1: issue every load for UNROLL groups (weights, scales, activations, sums).
-    uint2 w0[UNROLL], w1[UNROLL];
-    float ws0[UNROLL], ws1[UNROLL];
+    uint2 w0[UNROLL][RT], w1[UNROLL][RT];
+    float ws0[UNROLL][RT], ws1[UNROLL][RT];
     uint32_t b[UNROLL][NT][8];
     float x[UNROLL][NT][2];
     int qs[UNROLL][NT][2];
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
-      const int g = g0 + u < g_end ? g0 + u : g_end - 1;  // clamp: tail repeats are skipped below
-      w0[u] = ok0 ? __ldg(reinterpret_cast<const uint2*>(c0 + g * 32)) : make_uint2(0x55555555u, 0x55555555u);
-      w1[u] = ok1 ? __ldg(reinterpret_cast<const uint2*>(c1 + g * 32)) : make_uint2(0x55555555u, 0x55555555u);
-      ws0[u] = ok0 ? __half2float(__ldg(wscale + (size_t)row0 * groups + g)) : 0.f;
-      ws1[u] = ok1 ? __half2float(__ldg(wscale + (size_t)row1 * groups + g)) : 0.f;
+      const int g = g0 + u < g_end ? g0 + u : g_end - 1;
+#pragma unroll
+      for (int r = 0; r < RT; ++r) {
+        w0[u][r] = ok0[r] ? __ldg(reinterpret_cast<const uint2*>(c0[r] + g * 32)) : make_uint2(0x55555555u, 0x55555555u);
+        w1[u][r] = ok1[r] ? __ldg(reinterpret_cast<const uint2*>(c1[r] + g * 32)) : make_uint2(0x55555555u, 0x55555555u);
+        ws0[u][r] = ok0[r] ? __half2float(__ldg(wscale + (size_t)row0[r] * groups + g)) : 0.f;
+        ws1[u][r] = ok1[r] ? __half2float(__ldg(wscale + (size_t)row1[r] * groups + g)) : 0.f;
+      }
 #pragma unroll
       for (int t = 0; t < NT; ++t) {
 #pragma unroll
@@ -98,85 +107,101 @@ __global__ void __launch_bounds__(128) pq2_mma_small_kernel(
         }
       }
     }
-    // Phase 2: tensor-core math and per-group scaling.
 #pragma unroll
     for (int u = 0; u < UNROLL; ++u) {
       if (g0 + u >= g_end) break;
 #pragma unroll
-      for (int t = 0; t < NT; ++t) {
-        int c[4] = {0, 0, 0, 0};
+      for (int t = 0; t < NT; ++t)
 #pragma unroll
-        for (int s = 0; s < 4; ++s) {
-          const uint32_t a[4] = {(w0[u].x >> (2 * s)) & 0x03030303u, (w1[u].x >> (2 * s)) & 0x03030303u,
-                                 (w0[u].y >> (2 * s)) & 0x03030303u, (w1[u].y >> (2 * s)) & 0x03030303u};
-          mma_s8(c, a, b[u][t][2 * s], b[u][t][2 * s + 1]);
-        }
+        for (int r = 0; r < RT; ++r) {
+          int c[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int j = 0; j < 2; ++j) {
-          acc[t][j] += (float)(c[j] - qs[u][t][j]) * ws0[u] * x[u][t][j];
-          acc[t][2 + j] += (float)(c[2 + j] - qs[u][t][j]) * ws1[u] * x[u][t][j];
+          for (int s = 0; s < 4; ++s) {
+            const uint32_t a[4] = {(w0[u][r].x >> (2 * s)) & 0x03030303u, (w1[u][r].x >> (2 * s)) & 0x03030303u,
+                                   (w0[u][r].y >> (2 * s)) & 0x03030303u, (w1[u][r].y >> (2 * s)) & 0x03030303u};
+            mma_s8(c, a, b[u][t][2 * s], b[u][t][2 * s + 1]);
+          }
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+            acc[r][t][j] += (float)(c[j] - qs[u][t][j]) * ws0[u][r] * x[u][t][j];
+            acc[r][t][2 + j] += (float)(c[2 + j] - qs[u][t][j]) * ws1[u][r] * x[u][t][j];
+          }
         }
-      }
     }
   }
 #pragma unroll
-  for (int t = 0; t < NT; ++t)
+  for (int r = 0; r < RT; ++r)
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      const int tk = t * 8 + tid * 2 + j;
-      if (tk >= M) continue;
-      if (split == 1) {
-        if (ok0) y[(size_t)tk * N + row0] = from_float<T>(acc[t][j]);
-        if (ok1) y[(size_t)tk * N + row1] = from_float<T>(acc[t][2 + j]);
-      } else {
-        float* p = partial + ((size_t)blockIdx.y * M + tk) * N;
-        if (ok0) p[row0] = acc[t][j];
-        if (ok1) p[row1] = acc[t][2 + j];
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        const int tk = t * 8 + tid * 2 + j;
+        if (tk >= M) continue;
+        if (split == 1) {
+          if (ok0[r]) y[(size_t)tk * N + row0[r]] = from_float<T>(acc[r][t][j]);
+          if (ok1[r]) y[(size_t)tk * N + row1[r]] = from_float<T>(acc[r][t][2 + j]);
+        } else {
+          float* p = partial + ((size_t)blockIdx.y * M + tk) * N;
+          if (ok0[r]) p[row0[r]] = acc[r][t][j];
+          if (ok1[r]) p[row1[r]] = acc[r][t][2 + j];
+        }
       }
-    }
 }
 
-template <typename T, int NT, int UNROLL>
+template <typename T, int NT, int UNROLL, int RT>
 static int launch_t(const void* q, const void* xs, const void* qsum, const void* codes, const void* ws, void* y,
                     void* partial, int M, int N, int K, int split, int warps, cudaStream_t stream) {
   const int tiles = (N + 15) / 16;
-  dim3 grid((tiles + warps - 1) / warps, split), block(32 * warps);
-  pq2_mma_small_kernel<T, NT, UNROLL><<<grid, block, 0, stream>>>(
+  const int warp_total = (tiles + RT - 1) / RT;
+  dim3 grid((warp_total + warps - 1) / warps, split), block(32 * warps);
+  pq2_mma_small_kernel<T, NT, UNROLL, RT><<<grid, block, 0, stream>>>(
       (const int8_t*)q, (const float*)xs, (const int*)qsum, (const uint8_t*)codes, (const __half*)ws, (T*)y,
       (float*)partial, M, N, K, split);
   return (int)cudaGetLastError();
 }
 
-template <typename T, int NT>
+template <typename T, int NT, int RT>
 static int launch_u(int unroll, const void* q, const void* xs, const void* qsum, const void* codes, const void* ws,
                     void* y, void* partial, int M, int N, int K, int split, int warps, cudaStream_t s) {
   switch (unroll) {
-    case 1: return launch_t<T, NT, 1>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
-    case 2: return launch_t<T, NT, 2>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
-    case 4: return launch_t<T, NT, 4>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
-    case 8: return launch_t<T, NT, 8>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 1: return launch_t<T, NT, 1, RT>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 2: return launch_t<T, NT, 2, RT>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 4: return launch_t<T, NT, 4, RT>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 8: return launch_t<T, NT, 8, RT>(q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+  }
+  return -1;
+}
+
+template <typename T, int NT>
+static int launch_r(int rt, int unroll, const void* q, const void* xs, const void* qsum, const void* codes,
+                    const void* ws, void* y, void* partial, int M, int N, int K, int split, int warps,
+                    cudaStream_t s) {
+  switch (rt) {
+    case 1: return launch_u<T, NT, 1>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 2: return launch_u<T, NT, 2>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    case 4: return launch_u<T, NT, 4>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
   }
   return -1;
 }
 
 static int pq2_mma_small_dispatch(const void* q, const void* xs, const void* qsum, const void* codes,
                                     const void* ws, void* y, void* partial, int M, int N, int K, int bf16,
-                                    int split, int warps, int unroll, void* stream) {
+                                    int split, int warps, int unroll, int rt, void* stream) {
   if (M < 1 || M > 16 || (K & 127) || ((K >> 7) % split)) return -2;
   cudaStream_t s = (cudaStream_t)stream;
   const bool two = M > 8;
   if (bf16)
-    return two ? launch_u<__nv_bfloat16, 2>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s)
-               : launch_u<__nv_bfloat16, 1>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
-  return two ? launch_u<__half, 2>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s)
-             : launch_u<__half, 1>(unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+    return two ? launch_r<__nv_bfloat16, 2>(rt, unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s)
+               : launch_r<__nv_bfloat16, 1>(rt, unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
+  return two ? launch_r<__half, 2>(rt, unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s)
+             : launch_r<__half, 1>(rt, unroll, q, xs, qsum, codes, ws, y, partial, M, N, K, split, warps, s);
 }
 
 #ifdef PQ2_STANDALONE
 extern "C" int pq2_mma_small_launch(const void* q, const void* xs, const void* qsum, const void* codes,
                                     const void* ws, void* y, void* partial, int M, int N, int K, int bf16,
                                     int split, int warps, int unroll, void* stream) {
-  return pq2_mma_small_dispatch(q, xs, qsum, codes, ws, y, partial, M, N, K, bf16, split, warps, unroll, stream);
+  return pq2_mma_small_dispatch(q, xs, qsum, codes, ws, y, partial, M, N, K, bf16, split, warps, unroll, 1, stream);
 }
 #else
 #include <torch/csrc/inductor/aoti_torch/c/shim.h>
@@ -187,7 +212,8 @@ using torch::headeronly::ScalarType;
 using torch::stable::Tensor;
 
 // y[M, N] (BF16/FP16, written in place) from plane-ordered Q8 activations and prepared PQ2 planes.
-void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, int64_t warps, int64_t unroll) {
+void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, int64_t warps, int64_t unroll,
+                   int64_t rt) {
   const int32_t device_idx = q.get_device_index();
   const torch::stable::accelerator::DeviceGuard guard(device_idx);
   void* raw_stream = nullptr;
@@ -200,7 +226,7 @@ void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, in
   const char* codes = (const char*)weight.data_ptr();
   const int err = pq2_mma_small_dispatch(q.data_ptr(), xs.data_ptr(), qsum.data_ptr(), codes,
                                          codes + (size_t)N * K / 4, y.data_ptr(), nullptr, M, N, K,
-                                         y.scalar_type() == ScalarType::BFloat16, 1, (int)warps, (int)unroll,
+                                         y.scalar_type() == ScalarType::BFloat16, 1, (int)warps, (int)unroll, (int)rt,
                                          raw_stream);
   STD_TORCH_CHECK(err == 0, "pq2_mma_small: launch failed with code ", err);
 }
