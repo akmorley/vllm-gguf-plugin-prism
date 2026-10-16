@@ -141,3 +141,16 @@ def test_defaults_in_fresh_process():
     assert run()==[True,True,True]
     env.update({key:'0' for key in keys})
     assert run()==[False,False,False]
+
+
+def test_register_tiled_variants_are_bit_exact(enabled,monkeypatch):
+    """RT > 1 changes only how many row tiles a warp handles; every output element is unchanged."""
+    cases=[(m,n,k) for m,t in small.CUDA_RT_BY_M.items() for n,k in t]
+    assert cases and any(small.cuda_for(m,n,k)[2]>1 for m,n,k in cases)
+    for m,n,k in cases:
+        w=_weight(n,k);torch.manual_seed(m);x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+        monkeypatch.setattr(small,'_CUDA_RT',False)
+        base=small.pq2_small_mmq(x,w) if small.cuda_for(m,n,k) is not None else small.pq2_small_mmq(x,w)
+        monkeypatch.setattr(small,'_CUDA_RT',True)
+        tiled=small.pq2_small_mmq(x,w)
+        assert torch.equal(base,tiled),(m,n,k)
