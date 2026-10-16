@@ -154,3 +154,120 @@ def test_register_tiled_variants_are_bit_exact(enabled,monkeypatch):
         monkeypatch.setattr(small,'_CUDA_RT',True)
         tiled=small.pq2_small_mmq(x,w)
         assert torch.equal(base,tiled),(m,n,k)
+
+
+@pytest.mark.parametrize('dtype',[torch.bfloat16,torch.float16])
+def test_ring_kernel_matches_direct_fragment_path(enabled,monkeypatch,dtype):
+    """cp.async-ring kernel: bit-identical where the summation order is unchanged, FP32-rounding close otherwise,
+    deterministic, and the split-K tile counters are left zeroed."""
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    cases=[(m,n,k) for m,t in small.RING_BY_M.items() for n,k in t]
+    assert cases
+    for m,n,k in cases:
+        w=_weight(n,k);torch.manual_seed(m*7+n);x=torch.randn(m,k,device='cuda',dtype=dtype)
+        monkeypatch.setattr(small,'_RING',False)
+        assert small.ring_for(m,n,k) is None
+        base=small.pq2_small_mmq(x,w)
+        monkeypatch.setattr(small,'_RING',True)
+        assert small.ring_for(m,n,k) is not None
+        got=small.pq2_small_mmq(x,w);again=small.pq2_small_mmq(x,w)
+        assert torch.equal(got,again),(m,n,k)
+        if (m,n,k) in small.RING_EXACT:
+            assert torch.equal(got,base),(m,n,k)
+        else:
+            assert _rel_rms(got,base)<5e-4,(m,n,k,_rel_rms(got,base))
+    assert int(small._ring_workspace(torch.device('cuda',torch.cuda.current_device()))[1].abs().sum())==0
+
+
+def test_ring_dispatch_scope(enabled,monkeypatch):
+    """Only tabled (M, N, K) entries use the ring kernel; everything else keeps its previous path."""
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    seen=[]
+    real=small._pq2_mma_ring
+    monkeypatch.setattr(small,'_pq2_mma_ring',lambda x,w,cfg,split:seen.append(x.shape[0]) or real(x,w,cfg,split))
+    n,k=5120,17408;w=_weight(n,k)
+    for m in range(1,17):
+        small.pq2_small_mmq(torch.randn(m,k,device='cuda',dtype=torch.bfloat16),w) if 2<=m<=16 else None
+    assert seen==[m for m in range(2,9)]
+    seen.clear()
+    w2=_weight(34816,5120)
+    for m in (4,8):small.pq2_small_mmq(torch.randn(m,5120,device='cuda',dtype=torch.bfloat16),w2)
+    assert seen==[]
+
+
+def test_ring_exact_only_switch(enabled,monkeypatch):
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    monkeypatch.setattr(small,'_RING_EXACT_ONLY',True)
+    for m,t in small.RING_BY_M.items():
+        for n,k in t:
+            assert (small.ring_for(m,n,k) is not None)==((m,n,k) in small.RING_EXACT),(m,n,k)
+    n,k=5120,17408;w=_weight(n,k);x=torch.randn(8,k,device='cuda',dtype=torch.bfloat16)
+    monkeypatch.setattr(small,'_RING',False)
+    base=small.pq2_small_mmq(x,w)
+    monkeypatch.setattr(small,'_RING',True)
+    assert torch.equal(small.pq2_small_mmq(x,w),base)   # `down` is not in RING_EXACT: previous path, identical
+
+
+def _split_entry():
+    for m,t in small.RING_BY_M.items():
+        for (n,k),(cfg,split) in t.items():
+            if split>1:
+                return m,n,k
+    pytest.skip('no split-K ring entry')
+
+
+def test_ring_workspace_sizes_cover_the_table(enabled):
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    partial,counters=small._ring_workspace(torch.device('cuda',torch.cuda.current_device()))
+    for m,t in small.RING_BY_M.items():
+        for (n,k),(cfg,split) in t.items():
+            if split>1:
+                assert partial.numel()>=split*m*n
+            assert counters.numel()>=-(-n//16)
+
+
+def test_ring_cuda_graph_capture_and_replay(enabled,monkeypatch):
+    """Eager warm-up creates the workspace; a captured graph then replays the split-K launch repeatedly with identical
+    results, leaving the counters at zero."""
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    m,n,k=_split_entry();w=_weight(n,k);torch.manual_seed(5)
+    x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+    eager=small.pq2_small_mmq(x,w)
+    stream=torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        small.pq2_small_mmq(x,w)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out=small.pq2_small_mmq(x,w)
+    for _ in range(3):
+        graph.replay();torch.cuda.synchronize()
+        assert torch.equal(out,eager)
+    assert int(small._ring_workspace(x.device)[1].abs().sum())==0
+
+
+def test_ring_first_split_call_inside_capture_falls_back(enabled,monkeypatch):
+    """With no workspace yet, capturing must not allocate it (the counters' zero fill would be captured, not executed):
+    the call takes the previous path instead, and its result matches the ring-disabled output."""
+    if not small._ring_available():
+        pytest.skip('pq2_mma_ring not built')
+    m,n,k=_split_entry();w=_weight(n,k);torch.manual_seed(6)
+    x=torch.randn(m,k,device='cuda',dtype=torch.bfloat16)
+    monkeypatch.setattr(small,'_RING',False);base=small.pq2_small_mmq(x,w)
+    monkeypatch.setattr(small,'_RING',True)
+    monkeypatch.setattr(small,'_RING_WS',{})
+    stream=torch.cuda.Stream()
+    with torch.cuda.stream(stream):   # warm the previous path's kernels outside capture
+        monkeypatch.setattr(small,'_RING',False);small.pq2_small_mmq(x,w);monkeypatch.setattr(small,'_RING',True)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph=torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out=small.pq2_small_mmq(x,w)
+    assert small._RING_WS=={}
+    graph.replay();torch.cuda.synchronize()
+    assert torch.equal(out,base)

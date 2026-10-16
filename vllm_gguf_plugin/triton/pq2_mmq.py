@@ -12,15 +12,16 @@ import torch
 import triton
 import triton.language as tl
 
+from . import pq2_config as _config
 from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 
 # Shape-adaptive tiles; bit-exact with the fixed 64x128 tile. GGUF_PQ2_MMQ_TUNED_TILES=0 reverts.
-_TUNED_TILES = os.environ.get("GGUF_PQ2_MMQ_TUNED_TILES", "1") == "1"
+_TUNED_TILES = _config.flag("GGUF_PQ2_MMQ_TUNED_TILES", "exact_class")
 # Batched activation quantize (bit-exact with the one-group-per-program kernel).
-_QUANT_ROWS = os.environ.get("GGUF_PQ2_PREFILL_ROWS", "1") == "1"
+_QUANT_ROWS = _config.flag("GGUF_PQ2_PREFILL_ROWS", "exact_class")
 # Hand-written INT8 tensor-core prefill kernel (prepared weights, SM86, group-128): bit-exact with the
 # Triton kernel and ~15% faster sustained at a 300 W cap on wide shapes, ~35% on the N = 5120 ones.
-_MMA_PREFILL = os.environ.get("GGUF_PQ2_MMA_PREFILL", "1") == "1"
+_MMA_PREFILL = _config.flag("GGUF_PQ2_MMA_PREFILL", "exact_class")
 
 
 @triton.jit

@@ -102,77 +102,101 @@ supported-model list does not by itself guarantee GGUF compatibility. When
 reporting an unsupported model, include the model repository, quantization,
 plugin and vLLM versions, and the complete weight-mapping error.
 
-## Prism serving benchmark
+## Ternary Bonsai (PQ2) models
 
-Use the serving benchmark guide (`pq2-dev/benchmarks/plugin-archive/benchmarks/SERVING.md` in the
-containing workspace) to measure the local
-27B model across prompt lengths and request concurrency. The harness saves
-throughput, latency percentiles, GPU memory samples, and raw vLLM results.
+This plugin can run PrismML's Ternary Bonsai models, which store most weights as one of three values (-1, 0 or +1)
+in the `PQ2_0` GGUF format. A 27 billion parameter model of this kind fits in about 7 GB of GPU memory. Running it
+fast needs special code, and that code is what this section describes.
 
-The experimental PQ2 integer decode guide
-(`pq2-dev/benchmarks/plugin-archive/benchmarks/PQ2_INTEGER_DECODE.md` in the containing workspace)
-documents the default-off `GGUF_PQ2_INT_GEMV=1` experiment, measured dispatch
-rules, kernel results, and numerical acceptance work.
+### Turning the fast code on
 
-## PQ2 single-request decode defaults
-
-The optimized PQ2 decode path defaults to the prepared single-token byte kernel
-(`GGUF_PQ2_SINGLE_GEMV=1`) with fixed per-shape tiles and PRMT code decoding.
-These apply when the integer-decode path is enabled. For the tested optimized
-serving configuration, use `GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`, and
-`GGUF_PQ2_MMQ=1` (MMQ activation group 128).
-
-The single-token specialization selects only the six measured projection
-shapes on SM86 with BF16/FP16 and prepared weights. Other inputs retain their
-existing dispatch. Batch-eight chaining (`GGUF_PQ2_BATCH8_CHAINED=1`) and the
-small floating output-projection tiles at M = 5..16
-(`GGUF_PQ2_SMALL_FLOAT_OUTPUT=1`, bit-exact) are default-on. Resolved settings
-and kernel versions enter the compilation cache identity.
-
-To use the generic integer kernel at M = 1 instead, set
-`GGUF_PQ2_SINGLE_GEMV=0`.
-
-Superseded experiment switches (`GGUF_PQ2_BATCHED_GEMV`,
-`GGUF_PQ2_INT_GEMV_VARIANT`, `GGUF_PQ2_INT_GEMV_DECODE`,
-`GGUF_PQ2_INT_GEMV_CHAINED`, `GGUF_PQ2_MMQ_GROUP`,
-`GGUF_PQ2_BATCH8_FLOAT_OUTPUT_BM`, `GGUF_PQ2_BATCH8_SMALL_MMQ`) have been
-removed and are ignored if set.
-The experimental attention split override is not enabled by this promotion.
-
-Full-model measurements with 4096 input and 2048 generated tokens showed
-18.22% and 17.62% higher generation throughput on the two RTX 3090 Ti GPUs.
-
-## Small batches and speculative decoding (defaults)
-
-Within the integer-decode path (`GGUF_PQ2_INT_GEMV=1`, `GGUF_PQ2_PREPARED=1`,
-SM86), these are on by default:
-
-| Switch | Effect | Disable |
-|---|---|---|
-| `GGUF_PQ2_SMALL_MMQ` | INT8 tensor-core projections for M = 2..64 (direct-fragment CUDA kernel for M <= 8, Triton with 16/32/64-row token tiles above); also tiles the M = 2..4 floating output projection | `=0` |
-| `GGUF_PQ2_SMALL_MMQ_OUTPUT` | the 5120x6144 output projection at M = 2..8 through the INT8 kernel (as at M = 1); ~0.7% relative change on those outputs | `=0` |
-| `GGUF_PQ2_VERIFY_ATTN` | split-KV attention for 2..16-token queries of one request (speculative verification), exact prefix/tail decomposition | `=0` |
-
-DFlash2 speculative decoding is a server option. On RTX 3090/3090 Ti cards the
-measured best is five draft tokens with an FP8 draft:
+Set these three variables before starting the server:
 
 ```bash
-GGUF_PQ2_INT_GEMV=1 GGUF_PQ2_PREPARED=1 GGUF_PQ2_MMQ=1 \
-vllm serve Ternary-Bonsai-2-27B-PQ2_0.gguf --tokenizer <qwen3.8 tokenizer> \
-  --speculative-config '{"method": "dflash", "model": "<bonsai-dflash2 BF16 dir>", "num_speculative_tokens": 5, "quantization": "fp8"}'
+export GGUF_PQ2_INT_GEMV=1 GGUF_PQ2_PREPARED=1 GGUF_PQ2_MMQ=1
+vllm serve Ternary-Bonsai-2-27B-PQ2_0.gguf --tokenizer <tokenizer directory> \
+  --dtype bfloat16 --kv-cache-dtype int8_per_token_head
 ```
 
-The FP8 draft needs a vLLM build with quantized DFlash context-K/V support
-(`vllm-prism` branch `dflash-quantized-context-kv`); without it, omit
-`"quantization"` (BF16 draft, about 10% slower). Measured on one RTX 3090 Ti:
-about 2.0-2.3x plain decoding for one request from 4K to 32K context, 1.8x at
-two concurrent requests and 1.4x at four. At eight concurrent requests plain
-decoding is faster, so do not enable speculation for heavily batched serving.
+Without them the model still loads and runs, but through slower general-purpose code.
 
-## Optional single-request Triton attention
+The fast paths are written for NVIDIA GPUs of the Ampere family with compute capability 8.6 (the GeForce RTX 30
+series, the RTX A4000 and similar). They also need the model to run in `bfloat16` or `float16`. On any other GPU or
+data type the plugin quietly uses the general code instead.
 
-To keep FlashAttention 2 for prefill and use Triton for the measured
-single-request decode shape, set these variables before starting the server:
+On one RTX 3090 Ti limited to 300 W, a single request generated about 94 tokens per second, and a 4096-token prompt
+was processed at about 2000 tokens per second. Numbers depend heavily on the card and its power limit.
+
+### Choosing how aggressive to be
+
+One variable selects the whole set of fast paths:
+
+| `GGUF_PQ2_KERNELS` | What you get |
+|---|---|
+| `tuned` (default) | Everything, including a few paths whose results differ from the older code by tiny rounding amounts, and one that changes results by about 0.7% per layer (see below). |
+| `exact` | Only the fast paths that give bit-for-bit the same results as the older code. Use this when you need to compare outputs exactly. |
+| `legacy` | None of the newer fast paths. |
+
+Each fast path also has its own switch, which overrides the setting above when it is set to `0` or `1`. They are
+mainly useful for finding the cause of a problem or for comparing speeds.
+
+| Switch | What it controls | Same results as before? |
+|---|---|---|
+| `GGUF_PQ2_MMQ_TUNED_TILES` | Picks the work-split sizes for long prompts by shape | Yes |
+| `GGUF_PQ2_PREFILL_ROWS` | Processes several blocks per step in the prompt preparation steps | Yes |
+| `GGUF_PQ2_MMA_PREFILL` | Prompt processing on the GPU's integer matrix units | Yes |
+| `GGUF_PQ2_SMALL_MMQ_RT` | Reuses data between neighbouring rows for batches of 2 to 16 tokens | Yes |
+| `GGUF_PQ2_SMALL_MMQ_RING` | Streaming kernel for the narrow layers at batches of 2 to 8 tokens | Mostly (see next row) |
+| `GGUF_PQ2_SMALL_MMQ_RING_EXACT` | With the line above, keep only the cases that give identical results | Yes |
+| `GGUF_PQ2_M1_CUDA` | Hand-written kernel for generating one token at a time | Differs by rounding only |
+| `GGUF_PQ2_MMQ_OUTPUT` | Runs the 5120 x 6144 output layers on integer activations during prompt processing | About 0.7% per layer |
+
+"Rounding only" means the same numbers are added in a different order, so results can differ in the last few digits
+and are always the same from run to run. The output-layer switch changes results by a little more. We checked it on
+grade-school maths questions, science questions and perplexity, and saw no loss, but the science test is noisy, so
+use `GGUF_PQ2_KERNELS=exact` if you need the older results.
+
+These older switches still work: `GGUF_PQ2_SINGLE_GEMV` (the previous one-token kernel, `=0` to use the general
+one), `GGUF_PQ2_SMALL_MMQ` (integer matrix units for batches of 2 to 64 tokens), `GGUF_PQ2_SMALL_MMQ_OUTPUT`
+(integer version of the 5120 x 6144 layer at batches of 2 to 8 tokens, about 0.7% change) and
+`GGUF_PQ2_VERIFY_ATTN` (faster attention while checking drafted tokens). Several earlier experimental switches were
+removed and are ignored if set.
+
+The values that are in effect, and the version of the kernels, are included in vLLM's compile cache key, so changing a
+switch never reuses stale compiled code. If you compare two settings bit for bit, also set
+`VLLM_DISABLE_COMPILE_CACHE=1`: a cached compile and a fresh compile of the same model can give slightly different
+numbers.
+
+### Using less memory for the model's running state
+
+Most layers of this model keep a running summary of the text so far (they are called Gated DeltaNet layers). vLLM
+stores it in 32-bit floating point by default. Adding `--mamba-ssm-cache-dtype bfloat16` halves that memory and made
+generation a few percent faster (about 9% with eight requests at once). In our tests, perplexity over 32,000-token
+passages and a set of short maths questions did not change. We have not checked long reasoning tasks, so test it on
+your own workload first.
+
+### Faster generation with a draft model (speculative decoding)
+
+The DFlash2 draft model can generate several tokens ahead for the main model to check. On RTX 3090 and 3090 Ti cards
+the best setting we measured is five drafted tokens with an 8-bit (FP8) draft model:
+
+```bash
+vllm serve Ternary-Bonsai-2-27B-PQ2_0.gguf --tokenizer <tokenizer directory> \
+  --speculative-config '{"method": "dflash", "model": "<bonsai-dflash2 directory>", "num_speculative_tokens": 5, "quantization": "fp8"}'
+```
+
+The FP8 draft needs a vLLM build that supports it (the `dflash-quantized-context-kv` branch of the `vllm-prism`
+repository). With any other vLLM, leave out `"quantization"` and the draft runs in 16-bit, about 10% slower.
+
+For a single request this gave roughly 1.9 to 2.3 times the speed of normal generation, depending on the prompt
+(averages of about 210 tokens per second at a 1,000-token prompt and 180 to 195 at 4,000 tokens, against 94 to 97
+without a draft). The gain shrinks as more requests run at once: about 1.8 times with two, 1.4 times with four, and
+at eight requests normal generation is faster, so do not use drafting for heavily shared servers.
+
+### Optional: Triton attention for single requests
+
+By default the plugin uses vLLM's FlashAttention 2 for attention. For one request at a time you can swap in a Triton
+version for the generation step only:
 
 ```bash
 GGUF_PQ2_SINGLE_ATTN_BACKEND=triton \
@@ -180,17 +204,13 @@ GGUF_PQ2_SINGLE_ATTN_SEGMENTS=32 \
 vllm serve MODEL.gguf --attention-backend FLASH_ATTN [other options]
 ```
 
-The option is disabled by default (`GGUF_PQ2_SINGLE_ATTN_BACKEND=fa2`).
-It supports BF16 queries with 24 query heads, four KV heads and head dimension
-256 on SM86. Prefill, batched decode, other GPUs/shapes/dtypes, sliding-window
-attention, softcaps, auxiliary features and context parallelism retain FA2.
-The existing paged KV layout is preserved, including 784-token hybrid pages.
-Softmax scratch is allocated per call and retained by CUDA graph capture. The resolved backend, segment
-count and implementation version enter vLLM's compilation cache identity.
-Restart the server when changing settings.
+This is off by default and experimental. It only applies to models with 24 query heads, 4 key/value heads and a head
+size of 256, in `bfloat16` on compute capability 8.6 GPUs. Everything else, including prompt processing and batches,
+keeps using FlashAttention 2. The numerical checks passed, but the generated text can change, and its quality has not
+been evaluated, so check your results before relying on it. Keep `--attention-backend FLASH_ATTN` set, and restart the
+server after changing these variables. A 64-segment setting also exists; 32 is the tested starting point.
 
-A 64-segment option is also available; 32 is the tested starting point.
-Keep the `FLASH_ATTN` vLLM backend selected: this setting changes only eligible
-FA2 calls and does not replace other configured attention backends. This is an
-experimental option: numerical and graph checks passed, but greedy generated
-text can change. Language-quality evaluation is required before promotion.
+## License
+
+This package is released under the Apache License 2.0; see `LICENSE`. Some CUDA files were copied or adapted from
+llama.cpp, which is MIT licensed. They are listed, with the MIT text, in `THIRD_PARTY_NOTICES.md`.

@@ -11,10 +11,40 @@ import torch
 import triton
 import triton.language as tl
 
+from . import pq2_config as _config
+from . import pq2_tables as _tables
 from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 from .pq2_mmq import _quantize
 
 _SINGLE_GEMV = os.environ.get("GGUF_PQ2_SINGLE_GEMV", "1") == "1"
+# Single-token hand-written CUDA kernel (csrc/pq2/pq2_gemv_m1.cu): DP4A on the raw 2-bit planes, no PRMT decode. Same
+# integer products as the Triton kernel; FP32 group accumulation order differs (relative RMS ~1e-4, deterministic).
+# (N, K) -> kernel config. GGUF_PQ2_M1_CUDA=0 restores the Triton `_single` path.
+_M1_CUDA = _config.flag("GGUF_PQ2_M1_CUDA", "numerics_class")
+_M1_CFG = _tables.SM86.m1_cfg  # per-architecture tables: pq2_tables.py
+
+
+def _m1_available():
+    try:
+        from .. import _C_gguf  # noqa: F401
+    except ImportError:
+        return False
+    return hasattr(torch.ops, "_C_gguf") and hasattr(torch.ops._C_gguf, "pq2_gemv_m1")
+
+
+def _gemv_m1(x, weight, cfg):
+    from .pq2_small_mmq import _quantize_planes_sum
+
+    k = x.shape[1]
+    n = weight.shape[0]
+    groups = k // 128
+    q = torch.empty((1, k), dtype=torch.int8, device=x.device)
+    s = torch.empty((1, groups), dtype=torch.float32, device=x.device)
+    t = torch.empty((1, groups), dtype=torch.int32, device=x.device)
+    _quantize_planes_sum[(groups,)](x, q, s, t, k)
+    y = torch.empty((1, n), dtype=x.dtype, device=x.device)
+    torch.ops._C_gguf.pq2_gemv_m1(q, s, t, weight, y, cfg)
+    return y
 _BATCH8_CHAINED = os.environ.get("GGUF_PQ2_BATCH8_CHAINED", "1") == "1"
 
 
@@ -139,6 +169,11 @@ def pq2_int_gemv(x, weight, *, prepared=False, chained=None, quantized=None):
         validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if (_M1_CUDA and m == 1 and prepared and quantized is None and not chained and n
+            and x.dtype in (torch.bfloat16, torch.float16) and k % 512 == 0
+            and (n, k) in _M1_CFG and x.is_cuda
+            and torch.cuda.get_device_capability(x.device) == (8, 6) and _m1_available()):
+        return _gemv_m1(x, weight, _M1_CFG[(n, k)])
     bn, bc = _SINGLE_TILES.get((n, k), (16, 4)) if m == 1 else (16, 4)
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     if n:

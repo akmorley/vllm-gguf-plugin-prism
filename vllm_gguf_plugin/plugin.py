@@ -158,7 +158,7 @@ def _register_pq2_compile_factors() -> None:
 
     from . import attention
     from .quantization import linear
-    from .triton import pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism
+    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -168,11 +168,24 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_MMQ_VERSION"] = lambda: (
         "q8-groups-m128-byte32-v5-mma-prefill"
     )
-    envs.environment_variables["GGUF_PQ2_MMQ_TUNED_TILES"] = lambda: (
-        pq2_mmq._TUNED_TILES
-    )
-    envs.environment_variables["GGUF_PQ2_PREFILL_ROWS"] = lambda: pq2_mmq._QUANT_ROWS
-    envs.environment_variables["GGUF_PQ2_MMA_PREFILL"] = lambda: pq2_mmq._MMA_PREFILL
+
+    # The PQ2 kernel switches (see triton/pq2_config.py): the selected set, its version, and each path's
+    # resolved on/off state all enter the compile identity.
+    envs.environment_variables["GGUF_PQ2_KERNELS"] = lambda: pq2_config.KERNELS
+    envs.environment_variables["GGUF_PQ2_KERNEL_VERSION"] = lambda: pq2_config.KERNEL_VERSION
+    for env_name, module, attr in (
+        ("GGUF_PQ2_MMQ_TUNED_TILES", pq2_mmq, "_TUNED_TILES"),
+        ("GGUF_PQ2_PREFILL_ROWS", pq2_mmq, "_QUANT_ROWS"),
+        ("GGUF_PQ2_MMA_PREFILL", pq2_mmq, "_MMA_PREFILL"),
+        ("GGUF_PQ2_MMQ_OUTPUT", prism, "_MMQ_OUTPUT"),
+        ("GGUF_PQ2_SMALL_MMQ_RT", pq2_small_mmq, "_CUDA_RT"),
+        ("GGUF_PQ2_SMALL_MMQ_RING", pq2_small_mmq, "_RING"),
+        ("GGUF_PQ2_SMALL_MMQ_RING_EXACT", pq2_small_mmq, "_RING_EXACT_ONLY"),
+        ("GGUF_PQ2_M1_CUDA", pq2_int_gemv, "_M1_CUDA"),
+    ):
+        envs.environment_variables[env_name] = (
+            lambda module=module, attr=attr: getattr(module, attr)
+        )
 
     envs.environment_variables["GGUF_PQ2_SINGLE_ATTN_BACKEND"] = lambda: (
         attention._SINGLE_ATTN_BACKEND
@@ -223,11 +236,9 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_SMALL_FLOAT_OUTPUT"] = lambda: (
         prism._SMALL_FLOAT_OUTPUT
     )
-    envs.environment_variables["GGUF_PQ2_MMQ_OUTPUT"] = lambda: prism._MMQ_OUTPUT
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ"] = lambda: (
         pq2_small_mmq._SMALL_MMQ
     )
-    envs.environment_variables["GGUF_PQ2_SMALL_MMQ_RT"] = lambda: pq2_small_mmq._CUDA_RT
     envs.environment_variables["GGUF_PQ2_SMALL_MMQ_OUTPUT"] = lambda: (
         pq2_small_mmq._SMALL_MMQ_OUTPUT
     )
@@ -235,7 +246,7 @@ def _register_pq2_compile_factors() -> None:
         pq2_small_mmq._VERSION
     )
     envs.environment_variables["GGUF_PQ2_INT_GEMV_VERSION"] = lambda: (
-        "prmt-v2-tiles-batch8-chained-v5"
+        "prmt-v2-tiles-batch8-chained-v5-m1cuda"
     )
 
 

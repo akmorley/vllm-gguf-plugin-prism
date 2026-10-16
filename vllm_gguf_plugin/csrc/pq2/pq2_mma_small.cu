@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
+// Provenance: original code written for this plugin (Apache-2.0, like the rest of the package). It reads the PQ2_0
+// weight format defined by PrismML's fork of llama.cpp (MIT licensed): 128-weight groups of 2-bit codes with an FP16
+// scale. No llama.cpp source code is copied into this file. The tensor-core (mma.sync) and cp.async instructions are
+// NVIDIA PTX; see THIRD_PARTY_NOTICES.md for the parts of this package that are derived from llama.cpp.
 // PQ2 x Q8 small-batch projection with direct-fragment INT8 tensor-core MMA (SM80+/SM86).
 //
 // Y[t, n] = sum_g ws[n,g] * xs[t,g] * (sum_{i in g} code[n,i] * q[t,i] - qsum[t,g]),
@@ -14,22 +18,7 @@
 // No shared memory, no barriers; INT32 group sums equal the DP4A kernel's exactly.
 // RT 16-row weight tiles per warp share each group's activation fragments (RT = 1: one tile per warp);
 // per-element arithmetic is identical for every RT.
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <stdint.h>
-
-__device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-template <typename T> __device__ __forceinline__ T from_float(float v);
-template <> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { return __float2bfloat16(v); }
-template <> __device__ __forceinline__ __half from_float(float v) { return __float2half(v); }
+#include "pq2_common.cuh"
 
 // NT = number of 8-token column tiles (1: M<=8, 2: M<=16). UNROLL groups in flight per warp.
 // RT = 16-row weight tiles per warp: the activation fragments of each group are loaded once and
