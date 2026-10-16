@@ -182,6 +182,25 @@ def _register_pq2_compile_factors() -> None:
     envs.environment_variables["GGUF_PQ2_VERIFY_ATTN_VERSION"] = lambda: (
         attention._VERIFY_ATTN_VERSION
     )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_ATTN"] = lambda: attention._INT8_KV_ATTN
+    envs.environment_variables["GGUF_PQ2_INT8_KV_INT_QK"] = lambda: (
+        attention._INT8_KV_INT_QK
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_SEGMENTS"] = lambda: (
+        attention._INT8_KV_SEGMENTS
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_VERSION"] = lambda: (
+        attention._INT8_KV_VERSION
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL"] = lambda: (
+        attention._INT8_KV_PREFILL
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_RANGE"] = lambda: (
+        attention._INT8_KV_PREFILL_RANGE
+    )
+    envs.environment_variables["GGUF_PQ2_INT8_KV_PREFILL_VERSION"] = lambda: (
+        attention._INT8_KV_PREFILL_VERSION
+    )
 
     # Record resolved import-time choices, including defaults, in AOT cache keys.
     envs.environment_variables["GGUF_PQ2_INT_GEMV"] = lambda: (
