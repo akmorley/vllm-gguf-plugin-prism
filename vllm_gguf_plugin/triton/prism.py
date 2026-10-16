@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from . import pq2_config as _config
 from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 
 # Read once before graph capture; opt-in while model/serving acceptance is pending.
@@ -18,7 +19,7 @@ _EXPERIMENTAL_MMQ = os.environ.get("GGUF_PQ2_MMQ", "0") == "1"
 # output change, the same treatment the other MMQ projections already get). Default on after
 # GSM8K 120 -> 121/128, GPQA-Diamond 69 -> 66/198 (paired SE 2.5 pp) and 2K-32K perplexity
 # showed no regression (pq2-mmq-output-taskquality-20261015). GGUF_PQ2_MMQ_OUTPUT=0 reverts.
-_MMQ_OUTPUT = os.environ.get("GGUF_PQ2_MMQ_OUTPUT", "1") == "1"
+_MMQ_OUTPUT = _config.flag("GGUF_PQ2_MMQ_OUTPUT", "numerics_class")
 # Bit-exact: smaller floating row tiles for (5120, 6144) at M = 5..16 (8 rows up to M = 8,
 # 16 rows above), instead of padding to 64.
 _SMALL_FLOAT_OUTPUT = os.environ.get("GGUF_PQ2_SMALL_FLOAT_OUTPUT", "1") == "1"
@@ -103,7 +104,7 @@ def _hadamard_rows(
 # Below this many Hadamard blocks (decode and small verification batches) the one-block kernel
 # keeps more programs in flight.
 _HADAMARD_ROWS_MIN_BLOCKS = (
-    512 if os.environ.get("GGUF_PQ2_PREFILL_ROWS", "1") == "1" else 1 << 60
+    512 if _config.flag("GGUF_PQ2_PREFILL_ROWS", "exact_class") else 1 << 60
 )
 
 

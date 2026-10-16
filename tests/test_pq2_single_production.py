@@ -64,7 +64,7 @@ def test_single_resolved_compile_identity(monkeypatch):
     for enabled in (False,True):
         monkeypatch.setattr(integer,'_SINGLE_GEMV',enabled)
         assert envs.environment_variables['GGUF_PQ2_SINGLE_GEMV']()==enabled
-    assert envs.environment_variables['GGUF_PQ2_INT_GEMV_VERSION']()=='prmt-v2-tiles-batch8-chained-v5'
+    assert envs.environment_variables['GGUF_PQ2_INT_GEMV_VERSION']()=='prmt-v2-tiles-batch8-chained-v5-m1cuda'
 
 
 def test_promoted_defaults_in_fresh_process():

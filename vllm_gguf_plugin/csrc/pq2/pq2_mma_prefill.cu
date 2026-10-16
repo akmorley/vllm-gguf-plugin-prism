@@ -10,33 +10,7 @@
 // written by quantize_prefill (pq2_mmq.py): per token per group, lane `tid` of the MMA owns the 32
 // contiguous bytes [s*8 + h*4 + j] = q[4 * (8*tid + 4*h + j) + s], so a B fragment is two LDS.128.
 // CTA tile: (WR*RT*16 weight rows) x (WT*NT*8 tokens); cp.async multi-stage pipeline in shared memory.
-#include <cuda_bf16.h>
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
-#include <stdint.h>
-
-__device__ __forceinline__ void mma_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-  asm volatile(
-      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
-      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-__device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
-}
-__device__ __forceinline__ void cp_async8(void* dst, const void* src) {
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
-}
-__device__ __forceinline__ void cp_async4(void* dst, const void* src) {
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((uint32_t)__cvta_generic_to_shared(dst)), "l"(src));
-}
-__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
-template <typename T> __device__ __forceinline__ T from_float(float v);
-template <> __device__ __forceinline__ __nv_bfloat16 from_float(float v) { return __float2bfloat16(v); }
-template <> __device__ __forceinline__ __half from_float(float v) { return __float2half(v); }
+#include "pq2_common.cuh"
 
 template <int WR, int WT, int RT, int NT, int SG, int ST>
 struct Cfg {

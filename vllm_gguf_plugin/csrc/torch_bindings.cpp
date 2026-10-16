@@ -25,6 +25,9 @@ void pq2_mma_small(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y,
                    int64_t warps, int64_t unroll, int64_t rt);
 void pq2_mma_prefill(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y,
                      int64_t cfg);
+void pq2_mma_ring(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, Tensor partial,
+                  Tensor counters, int64_t cfg, int64_t split);
+void pq2_gemv_m1(Tensor q, Tensor xs, Tensor qsum, Tensor weight, Tensor y, int64_t cfg);
 
 STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
@@ -54,6 +57,13 @@ STABLE_TORCH_LIBRARY(_C_gguf, ops) {
   ops.def(
       "pq2_mma_prefill(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
       "Tensor(a!) y, int cfg) -> ()");
+  ops.def(
+      "pq2_mma_ring(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
+      "Tensor(a!) y, Tensor(b!) partial, Tensor(c!) counters, int cfg, "
+      "int split) -> ()");
+  ops.def(
+      "pq2_gemv_m1(Tensor q, Tensor xs, Tensor qsum, Tensor weight, "
+      "Tensor(a!) y, int cfg) -> ()");
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
@@ -67,6 +77,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CUDA, ops) {
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
   ops.impl("pq2_mma_small", TORCH_BOX(&pq2_mma_small));
   ops.impl("pq2_mma_prefill", TORCH_BOX(&pq2_mma_prefill));
+  ops.impl("pq2_mma_ring", TORCH_BOX(&pq2_mma_ring));
+  ops.impl("pq2_gemv_m1", TORCH_BOX(&pq2_gemv_m1));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_gguf, CompositeExplicitAutograd, ops) {
