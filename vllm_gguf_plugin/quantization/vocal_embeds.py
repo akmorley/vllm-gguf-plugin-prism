@@ -80,6 +80,17 @@ def recursive_replace_vocab_modules(
 
     replace(model, prefix)
 
+    for module in model.modules():
+        pending = module.__dict__.pop("_gguf_pending_tie", None)
+        if pending is None:
+            continue
+        embed_tokens = replacements.get(id(pending), pending)
+        if not hasattr(embed_tokens, "weight_type"):
+            raise RuntimeError(
+                "GGUF lm_head is tied to an embedding that is not GGUF-quantized"
+            )
+        module.quant_method.tie_weights(module, embed_tokens)
+
 
 def _apply_gguf_embedding(
     x: torch.Tensor,
@@ -245,6 +256,13 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         return out
 
     def tie_weights(self, layer: torch.nn.Module, embed_tokens: VocabParallelEmbedding):
+        if not hasattr(embed_tokens, "weight_type"):
+            # Some models (vLLM's Qwen3.5) build embed_tokens without a quant config
+            # and tie to it in __init__. recursive_replace_vocab_modules swaps in the
+            # GGUF embedding afterwards and completes the tie then.
+            # Plain __dict__ entry: nn.Module.__setattr__ would register it as a child.
+            layer.__dict__["_gguf_pending_tie"] = embed_tokens
+            return layer
         layer.weight = embed_tokens.weight
         layer.weight_type = embed_tokens.weight_type
         return layer
