@@ -197,6 +197,25 @@ _RING = _config.flag("GGUF_PQ2_SMALL_MMQ_RING", "exact_class")
 # entries (the largest gain, FP32 rounding-level reordering) are then left on the previous path.
 _RING_EXACT_ONLY = _config.flag("GGUF_PQ2_SMALL_MMQ_RING_EXACT", "exact_only_ring")
 _RING_WS = {}
+# Gluon port of the direct-fragment kernel with register prefetch (pq2_gluon_small.py), preferred over every CUDA
+# small-batch kernel where GLUON_BY_M lists it (26 cells at M = 2..8, tuned under the serving power proxy). 22 cells are
+# bit-identical to production (GLUON_EXACT); the rest differ at FP32 order. Opt-in until the serving A/B;
+# GGUF_PQ2_SMALL_GLUON=1 enables. GGUF_PQ2_KERNELS=exact keeps only the bit-identical cells.
+_GLUON = os.environ.get("GGUF_PQ2_SMALL_GLUON", "0") == "1"
+GLUON_BY_M = _tables.SM86.gluon_small
+GLUON_EXACT = _tables.SM86.gluon_exact
+
+
+def gluon_for(m, n, k):
+    """(warps, row tiles, groups per iteration, split) for the Gluon kernel, or None."""
+    if not _GLUON:
+        return None
+    from . import pq2_gluon_small
+    if not pq2_gluon_small.AVAILABLE:
+        return None
+    if _config.KERNELS == "exact" and (m, n, k) not in GLUON_EXACT:
+        return None
+    return GLUON_BY_M.get(m, {}).get((n, k))
 
 
 def _ring_available():
@@ -366,6 +385,7 @@ def eligible(x, weight, prepared):
         enabled
         and x.dtype in (torch.bfloat16, torch.float16)
         and (geometry_for(m, weight.shape[0], x.shape[1]) is not None
+             or gluon_for(m, weight.shape[0], x.shape[1]) is not None
              or cuda_for(m, weight.shape[0], x.shape[1]) is not None
              or ring_for(m, weight.shape[0], x.shape[1]) is not None)
         and torch.cuda.get_device_capability(x.device) == (8, 6)
@@ -378,6 +398,10 @@ def pq2_small_mmq(x, weight, geometry=None):
     _CALLS += 1
     m, k = x.shape
     n = weight.shape[0]
+    gl = None if geometry is not None else gluon_for(m, n, k)
+    if gl is not None:
+        from .pq2_gluon_small import pq2_gluon_small
+        return pq2_gluon_small(x, weight, *gl)
     ring = None if geometry is not None else ring_for(m, n, k)
     if ring is not None and ring[1] > 1 and _ring_workspace(x.device) is None:
         ring = None  # first split-K call happens inside graph capture: take the previous path instead

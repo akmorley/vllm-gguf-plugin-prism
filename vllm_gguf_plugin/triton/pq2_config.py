@@ -28,7 +28,7 @@ if KERNELS not in KERNEL_SETS:
     raise ValueError(f"GGUF_PQ2_KERNELS must be one of {KERNEL_SETS}, got {KERNELS!r}")
 
 # Bumped when a kernel or table in the set changes; part of the compile identity (see plugin.py).
-KERNEL_VERSION = "pq2-kernels-2026-10-15"
+KERNEL_VERSION = "pq2-kernels-2026-10-17"
 
 _ON = {
     "exact_class": {"tuned": True, "exact": True, "legacy": False},

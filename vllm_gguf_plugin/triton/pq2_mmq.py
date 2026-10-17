@@ -13,6 +13,7 @@ import triton
 import triton.language as tl
 
 from . import pq2_config as _config
+from . import pq2_tables as _tables
 from .pq2_layout import _pq2_codes, _pq2_scale, validate_prepared
 
 # Shape-adaptive tiles; bit-exact with the fixed 64x128 tile. GGUF_PQ2_MMQ_TUNED_TILES=0 reverts.
@@ -22,6 +23,13 @@ _QUANT_ROWS = _config.flag("GGUF_PQ2_PREFILL_ROWS", "exact_class")
 # Hand-written INT8 tensor-core prefill kernel (prepared weights, SM86, group-128): bit-exact with the
 # Triton kernel and ~15% faster sustained at a 300 W cap on wide shapes, ~35% on the N = 5120 ones.
 _MMA_PREFILL = _config.flag("GGUF_PQ2_MMA_PREFILL", "exact_class")
+# Triton port of the plane algorithm of that kernel (_mmq_planes: four masked-plane INT8 dots, -qsum per group), bit-exact
+# with both _mmq and the CUDA kernel. Where listed in the per-architecture table as faster it replaces the CUDA kernel, and
+# it replaces _mmq wherever _mmq would run on prepared group-128 weights at M >= 64 (so GGUF_PQ2_MMA_PREFILL=0 gives an
+# all-Triton prefill). Opt-in until the serving A/B; GGUF_PQ2_MMQ_PLANES=1 enables.
+_MMQ_PLANES = os.environ.get("GGUF_PQ2_MMQ_PLANES", "0") == "1"
+_PLANES_TILES = _tables.SM86.prefill_planes
+_PLANES_DEFAULT_TILE = (64, 256, 8, 2)
 
 
 @triton.jit
@@ -80,6 +88,98 @@ def _quantize_prefill(X, Q, S, T, G, R: tl.constexpr):
     tl.store(Q + r * 128 + pos, qi, mask)
     tl.store(S + r1, scale, r1 < G)
     tl.store(T + r1, tl.sum(qi.to(tl.int32), 1), r1 < G)
+
+
+@triton.jit
+def _quantize_planes_rows(X, Q, S, T, G, R: tl.constexpr):
+    """_quantize_prefill arithmetic, stored in plane order (i = 4 * byte + s -> s * 32 + byte), plus INT32 group sums."""
+    r1 = tl.program_id(0) * R + tl.arange(0, R)
+    r = r1[:, None]
+    i = tl.arange(0, 128)[None, :]
+    mask = r < G
+    a = tl.load(X + r * 128 + i, mask, other=0).to(tl.float32)
+    scale = tl.max(tl.abs(a), 1) / 127.0
+    normalized = tl.div_rn(a, tl.where(scale > 0, scale, 1.0)[:, None])
+    q = tl.minimum(
+        127.0, tl.maximum(-127.0, tl.extra.cuda.libdevice.nearbyint(normalized))
+    )
+    qi = q.to(tl.int8)
+    tl.store(Q + r * 128 + (i % 4) * 32 + i // 4, qi, mask)
+    tl.store(S + r1, scale, r1 < G)
+    tl.store(T + r1, tl.sum(qi.to(tl.int32), 1), r1 < G)
+
+
+@triton.jit(do_not_specialize=["M"])
+def _mmq_planes(Q, S, T, W, WS, Y, M, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    """Prefill on the raw 2-bit planes of prepared weights: plane s is `byte & (3 << 2s)` = code * 4^s (plane 3 is
+    pre-shifted by 2 to stay below 128), the exact INT32 product is shifted back, and the ternary -1 offset is applied
+    once per group as -T. Integer group sums and float epilogue order equal _mmq's (bit-exact)."""
+    G: tl.constexpr = K // 128
+    m = tl.program_id(0) * BM + tl.arange(0, BM)
+    n = tl.program_id(1) * BN + tl.arange(0, BN)
+    m_ok = m < M
+    n_ok = n < N
+    byte = tl.arange(0, 32)
+    acc = tl.full((BM, BN), 0, tl.float32)
+    for g in range(G):
+        packed = tl.load(W + n[None, :] * (K // 4) + g * 32 + byte[:, None], n_ok[None, :], other=0)
+        ab = Q + m[:, None] * K + g * 128 + byte[None, :]
+        part = tl.dot(tl.load(ab, m_ok[:, None], other=0), (packed & 0x03).to(tl.int8))
+        part += tl.dot(tl.load(ab + 32, m_ok[:, None], other=0), (packed & 0x0C).to(tl.int8)) >> 2
+        part += tl.dot(tl.load(ab + 64, m_ok[:, None], other=0), (packed & 0x30).to(tl.int8)) >> 4
+        part += tl.dot(tl.load(ab + 96, m_ok[:, None], other=0), ((packed >> 2) & 0x30).to(tl.int8)) >> 4
+        part -= tl.load(T + m * G + g, m_ok, other=0)[:, None]
+        xs = tl.load(S + m * G + g, m_ok, other=0)
+        ws = tl.load(WS + n * G + g, n_ok, other=0).to(tl.float32)
+        acc += part.to(tl.float32) * xs[:, None] * ws[None, :]
+    tl.store(Y + m[:, None] * N + n[None, :], acc, m_ok[:, None] & n_ok[None, :])
+
+
+def planes_tile(m, n, k):
+    """(BM, BN, warps, stages, faster_than_cuda) from the per-architecture table, or None."""
+    for m_max, tile, faster in _PLANES_TILES.get((n, k), ()):
+        if m <= m_max:
+            return (*tile, faster)
+    return None
+
+
+_PLANES_WARM = set()
+
+
+def _mmq_planes_run(x, weight, y, m, n, k, tile):
+    bm, bn, warps, stages = tile
+    groups = k // 128
+    q = torch.empty((m, k), dtype=torch.int8, device=x.device)
+    scales = torch.empty((m, groups), dtype=torch.float32, device=x.device)
+    sums = torch.empty((m, groups), dtype=torch.int32, device=x.device)
+    _quantize_planes_rows[(triton.cdiv(m * groups, 8),)](x, q, scales, sums, m * groups, 8, num_warps=4)
+    flat = weight.reshape(-1)
+    args = (q, scales, sums, flat[: n * k // 4], flat[n * k // 4:].view(torch.float16), y, m, n, k)
+    _mmq_planes[(triton.cdiv(m, bm), triton.cdiv(n, bn))](*args, bm, bn, num_warps=warps, num_stages=stages)
+
+
+def _warm_planes(x, weight, y, n, k):
+    """Compile (no launch) every tile a shape can use, on its first call whichever kernel that call takes.
+
+    Engine warm-up does not visit every M bucket, so a later prefill chunk would otherwise compile its tile on a live
+    request (~1 s per shape).
+    """
+    key = (n, k, y.dtype, x.device)
+    if key in _PLANES_WARM:
+        return
+    _PLANES_WARM.add(key)
+    groups = k // 128
+    flat = weight.reshape(-1)
+    args = (torch.empty((1, k), dtype=torch.int8, device=x.device),
+            torch.empty((1, groups), dtype=torch.float32, device=x.device),
+            torch.empty((1, groups), dtype=torch.int32, device=x.device),
+            flat[: n * k // 4], flat[n * k // 4:].view(torch.float16), y, 1, n, k)
+    tiles = {t for _m, t, _f in _PLANES_TILES.get((n, k), ())} | {_PLANES_DEFAULT_TILE}
+    for bm, bn, warps, stages in sorted(tiles):
+        _mmq_planes.warmup(*args, bm, bn, num_warps=warps, num_stages=stages, grid=(1,))
+    # The activation quantizer: Triton specializes the group count on divisibility by 16, so compile both variants.
+    for rows in (32, 33):
+        _quantize_planes_rows.warmup(x, args[0], args[1], args[2], rows, 8, num_warps=4, grid=(1,))
 
 
 def _mma_prefill_available():
@@ -191,6 +291,16 @@ def pq2_mmq(x, weight, *, prepared=False, activation_group=128):
     if weight.stride(1) != 1:
         weight = weight.contiguous()
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    planes = (
+        _MMQ_PLANES and m >= 64 and n and prepared and activation_group == 128
+        and weight.is_contiguous()
+    )
+    tile = planes_tile(m, n, k) if planes else None
+    if planes:
+        _warm_planes(x, weight, y, n, k)
+    if tile is not None and tile[4] and torch.cuda.get_device_capability(x.device) == (8, 6):
+        _mmq_planes_run(x, weight, y, m, n, k, tile[:4])
+        return y
     if (
         m >= 64
         and n
@@ -203,6 +313,9 @@ def pq2_mmq(x, weight, *, prepared=False, activation_group=128):
         and _mma_prefill_available()
     ):
         _mma_prefill(x, weight, y, m, n, k)
+        return y
+    if planes:
+        _mmq_planes_run(x, weight, y, m, n, k, tile[:4] if tile is not None else _PLANES_DEFAULT_TILE)
         return y
     if m and n:
         q = torch.empty((m, k), dtype=torch.int8, device=x.device)

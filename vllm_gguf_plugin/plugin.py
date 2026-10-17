@@ -182,6 +182,9 @@ def _register_pq2_compile_factors() -> None:
         ("GGUF_PQ2_SMALL_MMQ_RING", pq2_small_mmq, "_RING"),
         ("GGUF_PQ2_SMALL_MMQ_RING_EXACT", pq2_small_mmq, "_RING_EXACT_ONLY"),
         ("GGUF_PQ2_M1_CUDA", pq2_int_gemv, "_M1_CUDA"),
+        ("GGUF_PQ2_M1_TRITON", pq2_int_gemv, "_M1_TRITON"),
+        ("GGUF_PQ2_MMQ_PLANES", pq2_mmq, "_MMQ_PLANES"),
+        ("GGUF_PQ2_SMALL_GLUON", pq2_small_mmq, "_GLUON"),
     ):
         envs.environment_variables[env_name] = (
             lambda module=module, attr=attr: getattr(module, attr)

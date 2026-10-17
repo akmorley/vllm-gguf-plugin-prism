@@ -73,3 +73,46 @@ def test_dispatch_scope(monkeypatch):
     monkeypatch.setattr(ig, "_M1_CUDA", False)
     ig.pq2_int_gemv(x1, w, prepared=True)
     assert calls == []
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", sorted(ig._M1_TRITON_CFG))
+def test_triton_planes_matches_triton_single(monkeypatch, dtype, shape):
+    n, k = shape
+    w = _weight(n, k)
+    torch.manual_seed(n)
+    x = torch.randn(1, k, device="cuda", dtype=dtype)
+    monkeypatch.setattr(ig, "_M1_TRITON", False)
+    monkeypatch.setattr(ig, "_M1_CUDA", False)
+    expected = ig.pq2_int_gemv(x, w, prepared=True)
+    monkeypatch.setattr(ig, "_M1_TRITON", True)
+    calls = []
+    real = ig._gemv_m1_triton
+    monkeypatch.setattr(ig, "_gemv_m1_triton", lambda *a: calls.append(1) or real(*a))
+    first = ig.pq2_int_gemv(x, w, prepared=True)
+    second = ig.pq2_int_gemv(x, w, prepared=True)
+    assert calls == [1, 1]
+    assert torch.isfinite(first).all()
+    assert torch.equal(first, second)
+    assert _rel(first, expected) < 3e-4
+
+
+def test_triton_planes_dispatch_scope(monkeypatch):
+    assert (248320, 5120) in ig._M1_TRITON_CFG  # every M = 1 shape, lm_head included
+    n, k = 5120, 6144
+    w = _weight(n, k)
+    calls = []
+    real = ig._gemv_m1_triton
+    monkeypatch.setattr(ig, "_gemv_m1_triton", lambda *a: calls.append(1) or real(*a))
+    monkeypatch.setattr(ig, "_M1_TRITON", True)
+    x1 = torch.randn(1, k, device="cuda", dtype=torch.bfloat16)
+    ig.pq2_int_gemv(x1, w, prepared=True)
+    assert calls == [1]
+    calls.clear()
+    ig.pq2_int_gemv(torch.randn(2, k, device="cuda", dtype=torch.bfloat16), w, prepared=True)   # M = 2
+    ig.pq2_int_gemv(x1.float(), w, prepared=True)                                                # FP32 activations
+    ig.pq2_int_gemv(x1, w, prepared=True, chained=True)                                          # chained DP4A
+    assert calls == []
+    monkeypatch.setattr(ig, "_M1_TRITON", False)
+    ig.pq2_int_gemv(x1, w, prepared=True)
+    assert calls == []

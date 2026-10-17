@@ -22,6 +22,11 @@ _SINGLE_GEMV = os.environ.get("GGUF_PQ2_SINGLE_GEMV", "1") == "1"
 # (N, K) -> kernel config. GGUF_PQ2_M1_CUDA=0 restores the Triton `_single` path.
 _M1_CUDA = _config.flag("GGUF_PQ2_M1_CUDA", "numerics_class")
 _M1_CFG = _tables.SM86.m1_cfg  # per-architecture tables: pq2_tables.py
+# Triton port of the same plane-DP4A algorithm (pq2_single_gemv._single_planes), preferred over the CUDA kernel for all six
+# shapes: -4.3% matmul time per step in serving (nsys), +2.9% tok/s at 1 request, GSM8K answers unchanged. Opt-in;
+# GGUF_PQ2_M1_TRITON=1 enables. Same integer products; FP32 group order differs (relative RMS <= 1.6e-4 vs CUDA).
+_M1_TRITON = os.environ.get("GGUF_PQ2_M1_TRITON", "0") == "1"
+_M1_TRITON_CFG = _tables.SM86.m1_triton
 
 
 def _m1_available():
@@ -45,6 +50,24 @@ def _gemv_m1(x, weight, cfg):
     y = torch.empty((1, n), dtype=x.dtype, device=x.device)
     torch.ops._C_gguf.pq2_gemv_m1(q, s, t, weight, y, cfg)
     return y
+
+
+def _gemv_m1_triton(x, weight, cfg):
+    from .pq2_single_gemv import launch_planes
+    from .pq2_small_mmq import _quantize_planes_sum
+
+    k = x.shape[1]
+    n = weight.shape[0]
+    groups = k // 128
+    q = torch.empty((1, k), dtype=torch.int8, device=x.device)
+    s = torch.empty((1, groups), dtype=torch.float32, device=x.device)
+    t = torch.empty((1, groups), dtype=torch.int32, device=x.device)
+    _quantize_planes_sum[(groups,)](x, q, s, t, k)
+    y = torch.empty((1, n), dtype=x.dtype, device=x.device)
+    launch_planes(q, s, t, weight, y, n, k, *cfg)
+    return y
+
+
 _BATCH8_CHAINED = os.environ.get("GGUF_PQ2_BATCH8_CHAINED", "1") == "1"
 
 
@@ -169,6 +192,10 @@ def pq2_int_gemv(x, weight, *, prepared=False, chained=None, quantized=None):
         validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if (_M1_TRITON and m == 1 and prepared and quantized is None and not chained and n
+            and x.dtype in (torch.bfloat16, torch.float16) and (n, k) in _M1_TRITON_CFG and x.is_cuda
+            and torch.cuda.get_device_capability(x.device) == (8, 6)):
+        return _gemv_m1_triton(x, weight, _M1_TRITON_CFG[(n, k)])
     if (_M1_CUDA and m == 1 and prepared and quantized is None and not chained and n
             and x.dtype in (torch.bfloat16, torch.float16) and k % 512 == 0
             and (n, k) in _M1_CFG and x.is_cuda
