@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 import torch
@@ -120,6 +121,17 @@ class GGUFModelLoader(BaseModelLoader):
         model_name_or_path = model_config.model_weights or model_config.model
         if os.path.isfile(model_name_or_path):
             return model_name_or_path
+        if os.path.isdir(model_name_or_path):
+            local_gguf_files = sorted(
+                str(path) for path in Path(model_name_or_path).glob("*.gguf")
+            )
+            if len(local_gguf_files) == 1:
+                return local_gguf_files[0]
+            if local_gguf_files:
+                raise ValueError(
+                    f"Found multiple GGUF files in {model_name_or_path}; "
+                    "select one with <local_dir>:<quant_type>"
+                )
         # local_dir:quant_type (e.g. /path/to/gguf-dir:Q8_0)
         if ":" in model_name_or_path:
             local_dir, quant_type = model_name_or_path.rsplit(":", 1)

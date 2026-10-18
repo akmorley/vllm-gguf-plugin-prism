@@ -31,6 +31,13 @@ def _is_gguf_reference(model: str | None) -> bool:
     return model.endswith(".gguf") or is_remote_gguf(model) or is_gguf(model)
 
 
+def _is_local_gguf_directory(model: str | None) -> bool:
+    if not model:
+        return False
+    path = Path(model)
+    return path.is_dir() and any(path.glob("*.gguf"))
+
+
 def _get_gguf_config_source(
     model: str,
     tokenizer: str | None,
@@ -95,6 +102,7 @@ def _patch_engine_args() -> None:
             and getattr(target, "config_format", None) == "gguf"
             and isinstance(configured_model, str)
             and not _is_gguf_reference(configured_model)
+            and not _is_local_gguf_directory(configured_model)
         )
         if separate_draft:
             target.config_format = "auto"
@@ -105,10 +113,16 @@ def _patch_engine_args() -> None:
                 target.config_format = "gguf"
         if separate_draft and config is not None and config.draft_load_config is None:
             # Otherwise the draft inherits load_format="gguf" and the GGUF loader.
-            from vllm.config import LoadConfig
-
             config.draft_load_config = LoadConfig(
                 load_format="auto", download_dir=self.download_dir
+            )
+        elif (
+            config is not None
+            and config.draft_load_config is None
+            and _is_local_gguf_directory(configured_model)
+        ):
+            config.draft_load_config = LoadConfig(
+                load_format="gguf", download_dir=self.download_dir
             )
         gguf_model = self.model_weights
         if (
