@@ -157,8 +157,9 @@ mainly useful for finding the cause of a problem or for comparing speeds.
 
 With the default `tuned` set on an RTX 3090 or 3090 Ti, every PQ2 matrix multiply at 1 to 16 tokens and in prompt
 processing runs on Triton / Gluon kernels; the CUDA kernels remain as fallbacks for other GPUs, other shapes and larger
-batches. Compared with the CUDA kernels this is 5% faster at one request, 11% at four, 17% at eight, about 40% at 12 to
-16, and 7-9% faster at prompt processing (Qwen3.5 27B PQ2_0, RTX 3090 Ti at 300 W).
+batches. Compared with the previous defaults (the CUDA kernels) this is 4.8% faster at one request, 20% at four, 16% at
+eight, 35-41% at 12 to 16 concurrent requests and 7.5-8.5% faster at prompt processing (Ternary Bonsai 2 27B PQ2_0, RTX
+3090 Ti at 300 W, `--max-num-seqs 16`), with GSM8K answers identical on 127 of 128 questions.
 
 "Rounding only" means the same numbers are added in a different order, so results can differ in the last few digits
 and are always the same from run to run. The output-layer switch changes results by a little more. We checked it on
