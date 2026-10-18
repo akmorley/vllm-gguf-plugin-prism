@@ -193,7 +193,7 @@ class GGUFConfig(QuantizationConfig):
         prefix: str,
     ) -> "QuantizeMethodBase | None":
         from .fused_moe import GGUFMoEMethod
-        from .linear import GGUFLinearMethod
+        from .linear import GGUFLinearMethod, GGUFUnquantizedLinearMethod
         from .vocal_embeds import GGUFEmbeddingMethod
 
         # ----------------------------------------------------------
@@ -205,7 +205,7 @@ class GGUFConfig(QuantizationConfig):
                 self.unquantized_modules,
                 self.packed_modules_mapping,
             ):
-                return UnquantizedLinearMethod()
+                return GGUFUnquantizedLinearMethod()
 
             return GGUFLinearMethod(
                 self,

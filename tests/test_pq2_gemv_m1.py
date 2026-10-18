@@ -10,6 +10,14 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (8, 6),
     reason="SM86 CUDA required",
 )
+
+
+@pytest.fixture(autouse=True)
+def _new_default_path_off(monkeypatch):
+    """These tests exercise the CUDA M = 1 kernel and Triton `_single` (fallbacks of the Triton plane kernel, the default)."""
+    monkeypatch.setattr(ig, "_M1_TRITON", False)
+
+
 _WEIGHTS = {}
 
 

@@ -23,9 +23,9 @@ _SINGLE_GEMV = os.environ.get("GGUF_PQ2_SINGLE_GEMV", "1") == "1"
 _M1_CUDA = _config.flag("GGUF_PQ2_M1_CUDA", "numerics_class")
 _M1_CFG = _tables.SM86.m1_cfg  # per-architecture tables: pq2_tables.py
 # Triton port of the same plane-DP4A algorithm (pq2_single_gemv._single_planes), preferred over the CUDA kernel for all six
-# shapes: -4.3% matmul time per step in serving (nsys), +2.9% tok/s at 1 request, GSM8K answers unchanged. Opt-in;
-# GGUF_PQ2_M1_TRITON=1 enables. Same integer products; FP32 group order differs (relative RMS <= 1.6e-4 vs CUDA).
-_M1_TRITON = os.environ.get("GGUF_PQ2_M1_TRITON", "0") == "1"
+# shapes: -4.3% matmul time per step in serving (nsys), +2.9% tok/s at 1 request, GSM8K answers unchanged. In the `tuned`
+# kernel set; GGUF_PQ2_M1_TRITON=0 disables. Same integer products; FP32 group order differs (relative RMS <= 1.6e-4 vs CUDA).
+_M1_TRITON = _config.flag("GGUF_PQ2_M1_TRITON", "numerics_class")
 _M1_TRITON_CFG = _tables.SM86.m1_triton
 
 

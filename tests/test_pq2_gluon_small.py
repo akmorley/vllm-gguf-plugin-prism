@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gluon direct-fragment small-batch kernel versus the CUDA pq2_mma_small kernel, and its dispatch."""
+"""Gluon small-batch kernels (direct-fragment and cp.async ring) versus the CUDA kernels, and their dispatch."""
 import pytest
 import torch
 
-from vllm_gguf_plugin.triton import pq2_config, pq2_gluon_small as gl, pq2_small_mmq as sm
+from vllm_gguf_plugin.triton import pq2_config, pq2_gluon_ring as gr, pq2_gluon_small as gl, pq2_small_mmq as sm
 from vllm_gguf_plugin.triton.pq2_layout import prepare_pq2_layout
 
 pytestmark = pytest.mark.skipif(
@@ -28,7 +28,7 @@ def _rel(a, b):
 
 
 @pytest.mark.parametrize("cfg", [(2, 1, 8, 1), (4, 1, 4, 1), (8, 1, 2, 1), (2, 2, 4, 1), (4, 2, 8, 1)])
-@pytest.mark.parametrize("m", [1, 2, 3, 5, 8])
+@pytest.mark.parametrize("m", [1, 2, 3, 5, 8, 9, 12, 16])
 def test_split1_bit_identical_to_cuda(m, cfg):
     if not sm._cuda_available():
         pytest.skip("pq2_mma_small not built")
@@ -55,7 +55,7 @@ def test_split_k_deterministic(m, dtype):
 def test_rejects_bad_shapes():
     w = _weight(5120, 6144)
     with pytest.raises(ValueError):
-        gl.pq2_gluon_small(torch.randn(9, 6144, device="cuda", dtype=torch.bfloat16), w, 2, 1, 8, 1)   # M > 8
+        gl.pq2_gluon_small(torch.randn(17, 6144, device="cuda", dtype=torch.bfloat16), w, 2, 1, 8, 1)  # M > 16
     with pytest.raises(ValueError):
         gl.pq2_gluon_small(torch.randn(2, 6144, device="cuda", dtype=torch.bfloat16), w, 2, 1, 8, 5)   # 48 % 5
 
@@ -68,6 +68,7 @@ def test_dispatch(monkeypatch):
     monkeypatch.setattr(gl, "pq2_gluon_small", lambda *a: calls.append(a[2:]) or real(*a))
     table = {2: {(n, k): (2, 1, 2, 4)}, 3: {(n, k): (2, 1, 2, 4)}}
     monkeypatch.setattr(sm, "GLUON_BY_M", table)
+    monkeypatch.setattr(sm, "GLUON_RING_BY_M", {})
     monkeypatch.setattr(sm, "GLUON_EXACT", frozenset({(2, n, k)}))
     monkeypatch.setattr(sm, "_GLUON", True)
     x2 = torch.randn(2, k, device="cuda", dtype=torch.bfloat16)
@@ -92,15 +93,63 @@ def test_dispatch(monkeypatch):
 
 
 def test_table_entries_match_their_replacement():
-    """Every SM86 table entry: bit-identical where listed exact, otherwise within FP32 reordering."""
+    """Every SM86 table cell: bit-identical to the CUDA direct kernel at split 1, otherwise within FP32 reordering."""
     if not sm._cuda_available():
         pytest.skip("pq2_mma_small not built")
-    for m, shapes in sm.GLUON_BY_M.items():
-        for (n, k), cfg in shapes.items():
-            w = _weight(n, k)
-            x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-            y = gl.pq2_gluon_small(x, w, *cfg)
-            ref = sm._pq2_mma_small(x, w, 2, 4, 1)
-            if (m, n, k) in sm.GLUON_EXACT and cfg[3] == 1:
-                assert torch.equal(y, ref), (m, n, k)
-            assert _rel(y, ref) < 1e-4, (m, n, k)
+    cells = [(m, n, k, cfg, gl.pq2_gluon_small, cfg[3]) for m, t in sm.GLUON_BY_M.items() for (n, k), cfg in t.items()]
+    cells += [(m, n, k, cfg, gr.pq2_gluon_ring, cfg[4]) for m, t in sm.GLUON_RING_BY_M.items() for (n, k), cfg in t.items()]
+    for m, n, k, cfg, fn, split in cells:
+        assert not (m in sm.GLUON_BY_M and (n, k) in sm.GLUON_BY_M[m] and fn is gr.pq2_gluon_ring), (m, n, k)
+        w = _weight(n, k)
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        y = fn(x, w, *cfg)
+        ref = sm._pq2_mma_small(x, w, 2, 4, 1)
+        if split == 1:
+            assert torch.equal(y, ref), (m, n, k, cfg)
+        assert _rel(y, ref) < 1e-4, (m, n, k, cfg)
+
+
+@pytest.mark.parametrize("cfg", [(4, 1, 4, 2, 1), (4, 2, 4, 3, 1), (8, 1, 4, 3, 1), (2, 2, 2, 4, 1), (4, 2, 2, 2, 1)])
+@pytest.mark.parametrize("m", [1, 2, 5, 8, 9, 12, 16])
+def test_ring_split1_bit_identical_to_cuda(m, cfg):
+    if not sm._cuda_available():
+        pytest.skip("pq2_mma_small not built")
+    n, k = 4096 + 48, 5120  # N not a tile multiple
+    w = _weight(n, k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    assert torch.equal(gr.pq2_gluon_ring(x, w, *cfg), sm._pq2_mma_small(x, w, 2, 4, 1))
+
+
+@pytest.mark.parametrize("m", [2, 5, 8])
+def test_ring_split2_bit_identical_to_cuda_ring(m):
+    if not sm._ring_available():
+        pytest.skip("pq2_mma_ring not built")
+    n, k = 5120, 17408
+    w = _weight(n, k)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    sm._ring_workspace(x.device)
+    for cfg in ((4, 2, 4, 2, 2), (4, 2, 4, 3, 2), (8, 1, 2, 4, 2)):
+        assert torch.equal(gr.pq2_gluon_ring(x, w, *cfg), sm._pq2_mma_ring(x, w, 1, 2)), cfg
+
+
+def test_ring_rejects_bad_configs():
+    w = _weight(5120, 6144)
+    x = torch.randn(2, 6144, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        gr.pq2_gluon_ring(x, w, 4, 1, 1, 2, 1)       # SG = 1 is not supported
+    with pytest.raises(ValueError):
+        gr.pq2_gluon_ring(x, w, 4, 1, 4, 2, 5)       # 48 % 5
+
+
+def test_ring_dispatch(monkeypatch):
+    n, k = 5120, 6144
+    w = _weight(n, k)
+    calls = []
+    real = gr.pq2_gluon_ring
+    monkeypatch.setattr(gr, "pq2_gluon_ring", lambda *a: calls.append(a[2:]) or real(*a))
+    monkeypatch.setattr(sm, "GLUON_BY_M", {})
+    monkeypatch.setattr(sm, "GLUON_RING_BY_M", {3: {(n, k): (4, 2, 4, 3, 1)}})
+    monkeypatch.setattr(sm, "_GLUON", True)
+    sm.pq2_small_mmq(torch.randn(3, k, device="cuda", dtype=torch.bfloat16), w)
+    sm.pq2_small_mmq(torch.randn(4, k, device="cuda", dtype=torch.bfloat16), w)   # not listed
+    assert calls == [(4, 2, 4, 3, 1)]

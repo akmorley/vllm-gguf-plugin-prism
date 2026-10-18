@@ -158,7 +158,7 @@ def _register_pq2_compile_factors() -> None:
 
     from . import attention
     from .quantization import linear
-    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism
+    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism, small_gemm
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -185,6 +185,8 @@ def _register_pq2_compile_factors() -> None:
         ("GGUF_PQ2_M1_TRITON", pq2_int_gemv, "_M1_TRITON"),
         ("GGUF_PQ2_MMQ_PLANES", pq2_mmq, "_MMQ_PLANES"),
         ("GGUF_PQ2_SMALL_GLUON", pq2_small_mmq, "_GLUON"),
+        ("GGUF_PQ2_MMQ_GLUON", pq2_mmq, "_MMQ_GLUON"),
+        ("GGUF_SMALL_GEMM_TRITON", small_gemm, "ENABLED"),
     ):
         envs.environment_variables[env_name] = (
             lambda module=module, attr=attr: getattr(module, attr)

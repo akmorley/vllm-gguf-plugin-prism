@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gluon port of csrc/pq2/pq2_mma_small.cu: direct-fragment INT8 tensor-core MMA on the raw 2-bit planes (M <= 8).
+"""Gluon port of csrc/pq2/pq2_mma_small.cu: direct-fragment INT8 tensor-core MMA on the raw 2-bit planes (M <= 16).
 
 Each lane loads its 8 contiguous code bytes per row per 128-weight group (LDG.64) as two int32 words in the layout
 `words`, whose byte view is the m16n8k32 A-operand layout up to a register renaming (no data movement, no shared
@@ -99,7 +99,7 @@ if AVAILABLE:
     @gluon.jit
     def _gl_small(Q, S, T, W, WS, Y, M, N: ttgl.constexpr, K: ttgl.constexpr, BM: ttgl.constexpr, U: ttgl.constexpr,
                   MMA: ttgl.constexpr, WORDS: ttgl.constexpr, TRIVIAL: ttgl.constexpr,
-                  SPLIT: ttgl.constexpr = 1):
+                  SPLIT: ttgl.constexpr = 1, BT: ttgl.constexpr = 8):
         G: ttgl.constexpr = K // 128
         A_L: ttgl.constexpr = ttgl.DotOperandLayout(parent=MMA, operand_index=0, k_width=4)
         B_L: ttgl.constexpr = ttgl.DotOperandLayout(parent=MMA, operand_index=1, k_width=4)
@@ -110,15 +110,15 @@ if AVAILABLE:
         t = ttgl.arange(0, 4, layout=ttgl.SliceLayout(0, ttgl.SliceLayout(1, WORDS)))
         wp = W + r[:, None, None] * (K // 16) + 2 * t[None, None, :] + h[None, :, None]
         kb = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, B_L))
-        nb = ttgl.arange(0, 8, layout=ttgl.SliceLayout(0, B_L))
+        nb = ttgl.arange(0, BT, layout=ttgl.SliceLayout(0, B_L))
         qp = Q + nb[None, :] * K + kb[:, None]
         qmask = (nb < M)[None, :] & (kb >= 0)[:, None]
         rc = row0 + ttgl.arange(0, BM, layout=ttgl.SliceLayout(1, MMA))
-        nc = ttgl.arange(0, 8, layout=ttgl.SliceLayout(0, MMA))
+        nc = ttgl.arange(0, BT, layout=ttgl.SliceLayout(0, MMA))
         rcc = ttgl.minimum(rc, N - 1)
         n_ok = nc < M
         ncc = ttgl.where(n_ok, nc, 0)
-        acc = ttgl.zeros([BM, 8], ttgl.float32, layout=MMA)
+        acc = ttgl.zeros([BM, BT], ttgl.float32, layout=MMA)
         PER: ttgl.constexpr = G // SPLIT
         first = ttgl.program_id(1) * PER
         # register prefetch: the next U groups are loaded before the current U groups are computed (loop-carried);
@@ -135,12 +135,12 @@ if AVAILABLE:
 
 
 def pq2_gluon_small(x, weight, warps, rt, u, split=1):
-    """x: (M <= 8, K) floating, already rotated; weight: prepared PQ2 planes."""
+    """x: (M <= 16, K) floating, already rotated; weight: prepared PQ2 planes. Token tile 8 (M <= 8) or 16."""
     m, k = x.shape
     n = weight.shape[0]
     G = k // 128
-    if not 1 <= m <= 8 or k % 128 or weight.shape[1] != G * 34 or G % split or (G // split) % u:
-        raise ValueError("Gluon PQ2 kernel requires 1 to 8 tokens, a PQ2 matrix and a K split dividing K/128")
+    if not 1 <= m <= 16 or k % 128 or weight.shape[1] != G * 34 or G % split or (G // split) % u:
+        raise ValueError("Gluon PQ2 kernel requires 1 to 16 tokens, a PQ2 matrix and a K split dividing K/128")
     x = x.contiguous()
     q = torch.empty((m, k), dtype=torch.int8, device=x.device)
     s = torch.empty((m, G), dtype=torch.float32, device=x.device)
@@ -152,7 +152,7 @@ def pq2_gluon_small(x, weight, warps, rt, u, split=1):
     target = y if split == 1 else torch.empty((split, m, n), dtype=torch.float32, device=x.device)
     _gl_small[(triton.cdiv(n, bm), split)](q, s, t, flat[: n * k // 4].view(torch.int32),
                                             flat[n * k // 4:].view(torch.float16), target, m, n, k, bm, u, mma, words,
-                                            rt == 1, split, num_warps=warps)
+                                            rt == 1, split, 8 if m <= 8 else 16, num_warps=warps)
     if split > 1:
         _reduce_splits[(triton.cdiv(m * n, 1024),)](target, y, m * n, split, 1024)
     return y

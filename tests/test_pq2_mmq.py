@@ -7,6 +7,14 @@ from vllm_gguf_plugin.triton.pq2_mmq import pq2_mmq
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+
+@pytest.fixture(autouse=True)
+def _new_default_path_off(monkeypatch):
+    """These tests exercise the CUDA and Triton prefill paths (fallbacks of the Gluon prefill kernel, the default)."""
+    from vllm_gguf_plugin.triton import pq2_mmq
+    monkeypatch.setattr(pq2_mmq, "_MMQ_GLUON", False)
+
+
 @pytest.mark.parametrize("prepared", [False, True])
 @pytest.mark.parametrize("activation_group", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

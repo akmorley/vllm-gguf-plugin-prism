@@ -150,6 +150,15 @@ mainly useful for finding the cause of a problem or for comparing speeds.
 | `GGUF_PQ2_SMALL_MMQ_RING_EXACT` | With the line above, keep only the cases that give identical results | Yes |
 | `GGUF_PQ2_M1_CUDA` | Hand-written kernel for generating one token at a time | Differs by rounding only |
 | `GGUF_PQ2_MMQ_OUTPUT` | Runs the 5120 x 6144 output layers on integer activations during prompt processing | About 0.7% per layer |
+| `GGUF_PQ2_MMQ_GLUON` | Prompt processing with the Gluon (Triton) kernel instead of the CUDA one, 7-9% faster | Yes |
+| `GGUF_PQ2_SMALL_GLUON` | Gluon (Triton) kernels for batches of 2 to 16 tokens, replacing the CUDA and older Triton ones | Mostly; `exact` keeps only the identical cases |
+| `GGUF_PQ2_M1_TRITON` | Triton kernel for generating one token at a time, replacing the hand-written CUDA one | Differs by rounding only |
+| `GGUF_SMALL_GEMM_TRITON` | Triton kernel for small unquantized layers (Qwen3.5 `in_proj_ba`) at batches of up to 16 tokens, instead of cuBLAS | Differs by rounding only |
+
+With the default `tuned` set on an RTX 3090 or 3090 Ti, every PQ2 matrix multiply at 1 to 16 tokens and in prompt
+processing runs on Triton / Gluon kernels; the CUDA kernels remain as fallbacks for other GPUs, other shapes and larger
+batches. Compared with the CUDA kernels this is 5% faster at one request, 11% at four, 17% at eight, about 40% at 12 to
+16, and 7-9% faster at prompt processing (Qwen3.5 27B PQ2_0, RTX 3090 Ti at 300 W).
 
 "Rounding only" means the same numbers are added in a different order, so results can differ in the last few digits
 and are always the same from run to run. The output-layer switch changes results by a little more. We checked it on

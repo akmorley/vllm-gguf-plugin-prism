@@ -7,6 +7,14 @@ from vllm_gguf_plugin.triton.pq2_mmq import pq2_mmq
 
 pytestmark=pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(8,6),
                               reason='SM86 CUDA required')
+
+
+@pytest.fixture(autouse=True)
+def _new_default_path_off(monkeypatch):
+    """These tests exercise the CUDA / Triton small-batch paths (fallbacks of the Gluon kernels, the default)."""
+    monkeypatch.setattr(small, "_GLUON", False)
+
+
 CASES=sorted({(m,n,k) for tables in (small.GEOMETRY_BY_M,small.CUDA_BY_M) for m,table in tables.items() for n,k in table})
 _WEIGHTS={}
 

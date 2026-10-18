@@ -8,6 +8,7 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from vllm.model_executor.layers.linear import (
     LinearMethodBase,
+    UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -157,6 +158,42 @@ try:
     fused_mul_mat_gguf_prequantized = torch.ops.vllm._fused_mul_mat_gguf_prequantized
 except AttributeError as error:
     raise error
+
+
+def _gguf_small_unquant_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """x @ weight.T for the unquantized (BF16 / FP16) layers of a GGUF model: the split-K Triton kernel at M <= 16
+    (triton/small_gemm.py), cuBLAS otherwise. A custom op so that torch.compile does not specialize on the token count."""
+    from ..triton import small_gemm
+    if small_gemm.eligible(x, weight):
+        return small_gemm.small_gemm(x, weight)
+    return x @ weight.T
+
+
+def _gguf_small_unquant_gemm_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
+
+
+direct_register_custom_op(
+    op_name="_gguf_small_unquant_gemm",
+    op_func=_gguf_small_unquant_gemm,
+    fake_impl=_gguf_small_unquant_gemm_fake,
+)
+
+
+class GGUFUnquantizedLinearMethod(UnquantizedLinearMethod):
+    """vLLM's unquantized linear method for the BF16 / FP16 layers of a GGUF model (e.g. Qwen3.5 in_proj_ba). With
+    GGUF_SMALL_GEMM_TRITON=1 the GEMM goes through _gguf_small_unquant_gemm: cuBLAS picks an 8-CTA kernel without
+    split-K for the 96-output in_proj_ba at M = 2..4 (~30 us per call, 48 calls per decode step)."""
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        from ..triton import small_gemm
+        if not small_gemm.ENABLED or not x.is_cuda:
+            return super().apply(layer, x, bias)
+        leading = x.shape[:-1]
+        out = torch.ops.vllm._gguf_small_unquant_gemm(x.reshape(-1, x.shape[-1]), layer.weight)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*leading, out.shape[-1])
 
 
 @register_weight_loader_v2_supported_method

@@ -14,6 +14,10 @@ SWITCHES = {
     "GGUF_PQ2_MMQ_OUTPUT": "numerics_class",
     "GGUF_PQ2_M1_CUDA": "numerics_class",
     "GGUF_PQ2_SMALL_MMQ_RING_EXACT": "exact_only_ring",
+    "GGUF_PQ2_MMQ_GLUON": "exact_class",
+    "GGUF_PQ2_SMALL_GLUON": "exact_class",
+    "GGUF_PQ2_M1_TRITON": "numerics_class",
+    "GGUF_SMALL_GEMM_TRITON": "numerics_class",
 }
 EXPECTED = {
     "tuned": {"exact_class": True, "numerics_class": True, "exact_only_ring": False},

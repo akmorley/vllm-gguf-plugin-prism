@@ -6,6 +6,7 @@ Integer accumulation is reset at every PQ2 scale boundary. This implementation
 is independent of llama.cpp and does not promise identical Q8 rounding/layout.
 """
 
+import functools
 import os
 
 import torch
@@ -26,10 +27,34 @@ _MMA_PREFILL = _config.flag("GGUF_PQ2_MMA_PREFILL", "exact_class")
 # Triton port of the plane algorithm of that kernel (_mmq_planes: four masked-plane INT8 dots, -qsum per group), bit-exact
 # with both _mmq and the CUDA kernel. Where listed in the per-architecture table as faster it replaces the CUDA kernel, and
 # it replaces _mmq wherever _mmq would run on prepared group-128 weights at M >= 64 (so GGUF_PQ2_MMA_PREFILL=0 gives an
-# all-Triton prefill). Opt-in until the serving A/B; GGUF_PQ2_MMQ_PLANES=1 enables.
+# all-Triton prefill). Superseded by the Gluon prefill kernel below; opt-in, GGUF_PQ2_MMQ_PLANES=1 enables.
 _MMQ_PLANES = os.environ.get("GGUF_PQ2_MMQ_PLANES", "0") == "1"
 _PLANES_TILES = _tables.SM86.prefill_planes
 _PLANES_DEFAULT_TILE = (64, 256, 8, 2)
+# Gluon port of the CUDA prefill kernel (pq2_gluon_prefill.py): packed codes staged by cp.async and loaded straight into
+# MMA fragments; bit-exact with the CUDA kernel and _mmq; serving prefill +7-9% tok/s. Takes precedence over both
+# prefill paths for prepared group-128 weights at M >= 64. In the `tuned` and `exact` kernel sets; GGUF_PQ2_MMQ_GLUON=0
+# disables.
+_MMQ_GLUON = _config.flag("GGUF_PQ2_MMQ_GLUON", "exact_class")
+_GLUON_TILES = _tables.SM86.gluon_prefill
+_GLUON_DEFAULT_TILE = (4, 2, 4, 4, 2, 2)
+
+
+_GLUON_TILE_LIST = {shape: tuple(t for _m, t in tiles) for shape, tiles in _GLUON_TILES.items()}
+
+
+@functools.cache
+def _gluon_ok(device):
+    from . import pq2_gluon_prefill
+    return pq2_gluon_prefill.AVAILABLE and torch.cuda.get_device_capability(device) == (8, 6)
+
+
+def gluon_prefill_tile(m, n, k):
+    """(WR, WT, RT, NT, SG, ST) for the Gluon prefill kernel: table entry, or the default tile for other shapes."""
+    for m_max, tile in _GLUON_TILES.get((n, k), ()):
+        if m <= m_max:
+            return tile
+    return _GLUON_DEFAULT_TILE
 
 
 @triton.jit
@@ -290,6 +315,10 @@ def pq2_mmq(x, weight, *, prepared=False, activation_group=128):
         validate_prepared(weight)
     if weight.stride(1) != 1:
         weight = weight.contiguous()
+    if (_MMQ_GLUON and m >= 64 and n and prepared and activation_group == 128 and k % 256 == 0
+            and x.dtype in (torch.bfloat16, torch.float16) and weight.is_contiguous() and _gluon_ok(x.device)):
+        from .pq2_gluon_prefill import pq2_gluon_prefill
+        return pq2_gluon_prefill(x, weight, gluon_prefill_tile(m, n, k), _GLUON_TILE_LIST.get((n, k), ()))
     y = torch.empty((m, n), dtype=x.dtype, device=x.device)
     planes = (
         _MMQ_PLANES and m >= 64 and n and prepared and activation_group == 128
