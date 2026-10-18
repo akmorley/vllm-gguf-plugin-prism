@@ -7,7 +7,10 @@ selected on an RTX 3090 Ti (84 SMs, 300 W) against real captured decode rows; se
 pq2-dev/benchmarks/results/pq2-decode-kernel-design-20261015 and pq2-batched-decode-longctx-20261015.
 """
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field, replace
 
 # (N, K) shapes shared by several tables.
 _RT_WIDE = {(34816, 5120): (2, 8, 2), (16384, 5120): (4, 8, 2), (14336, 5120): (2, 8, 2)}
@@ -133,6 +136,84 @@ SM86 = Tables(
                         (1 << 30, (64, 256, 8, 3), True)),
     },
 )
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Per-card overrides. Cards of one compute capability can still want different tiles (the 48-SM, 140 W RTX A4000 against
+# the 84-SM RTX 3090 Ti these tables were tuned on), so GGUF_PQ2_TABLES may name a JSON file written by the A4000 tuner
+# (pq2-dev/deploy/a4000/tune/tune_a4000.py) that replaces or removes cells of the SM86 tables:
+#
+#   {"m1_triton":    {"34816x5120": [16, 8, 4, 1], ...},                  # null removes a cell (CUDA kernel)
+#    "gluon_small":  {"2": {"34816x5120": [2, 2, 4, 1]}, ...},
+#    "gluon_ring":   {"9": {"5120x6144": [4, 2, 4, 2, 2]}, ...},
+#    "gluon_exact":  {"add": [[2, 34816, 5120], ...], "remove": [...]},
+#    "gluon_prefill": {"5120x6144": [[255, [4, 2, 2, 4, 2, 3]], [1073741824, [4, 2, 4, 4, 2, 2]]], ...}}
+#
+# OVERRIDE_HASH (sha256 of the file, or "") enters the compile identity.
+# ---------------------------------------------------------------------------------------------------------------------
+def _shape(key):
+    n, k = key.split("x")
+    return int(n), int(k)
+
+
+def _apply_override(base, data):
+    """Tables with the cells of a tuner override replaced or removed (null)."""
+    changes = {}
+    if "m1_triton" in data:
+        m1 = dict(base.m1_triton)
+        for key, cfg in data["m1_triton"].items():
+            if cfg is None:
+                m1.pop(_shape(key), None)
+            else:
+                m1[_shape(key)] = tuple(cfg)
+        changes["m1_triton"] = m1
+    for name in ("gluon_small", "gluon_ring"):
+        if name in data:
+            table = {m: dict(cells) for m, cells in getattr(base, name).items()}
+            for m, cells in data[name].items():
+                row = table.setdefault(int(m), {})
+                for key, cfg in cells.items():
+                    if cfg is None:
+                        row.pop(_shape(key), None)
+                    else:
+                        row[_shape(key)] = tuple(cfg)
+            changes[name] = {m: row for m, row in table.items() if row}
+    if "gluon_exact" in data:
+        exact = set(base.gluon_exact)
+        exact |= {tuple(c) for c in data["gluon_exact"].get("add", ())}
+        exact -= {tuple(c) for c in data["gluon_exact"].get("remove", ())}
+        changes["gluon_exact"] = frozenset(exact)
+    if "gluon_prefill" in data:
+        pf = dict(base.gluon_prefill)
+        for key, buckets in data["gluon_prefill"].items():
+            if buckets is None:
+                pf.pop(_shape(key), None)
+            else:
+                pf[_shape(key)] = tuple((int(m), tuple(cfg)) for m, cfg in buckets)
+        changes["gluon_prefill"] = pf
+    # a cell may sit in at most one of the two Gluon small-batch tables; the override's table wins
+    if "gluon_small" in data or "gluon_ring" in data:
+        small = {m: dict(c) for m, c in changes.get("gluon_small", base.gluon_small).items()}
+        ring = {m: dict(c) for m, c in changes.get("gluon_ring", base.gluon_ring).items()}
+        for m, cells in data.get("gluon_small", {}).items():
+            for key, cfg in cells.items():
+                if cfg is not None and _shape(key) in ring.get(int(m), {}):
+                    ring[int(m)].pop(_shape(key))
+        for m, cells in data.get("gluon_ring", {}).items():
+            for key, cfg in cells.items():
+                if cfg is not None and _shape(key) in small.get(int(m), {}):
+                    small[int(m)].pop(_shape(key))
+        changes["gluon_small"], changes["gluon_ring"] = small, ring
+    return replace(base, **changes)
+
+
+OVERRIDE_PATH = os.environ.get("GGUF_PQ2_TABLES", "")
+OVERRIDE_HASH = ""
+if OVERRIDE_PATH:
+    with open(OVERRIDE_PATH, "rb") as f:
+        _raw = f.read()
+    OVERRIDE_HASH = hashlib.sha256(_raw).hexdigest()[:16]
+    SM86 = _apply_override(SM86, json.loads(_raw))
 
 BY_CAPABILITY = {(8, 6): SM86}
 EMPTY = Tables()

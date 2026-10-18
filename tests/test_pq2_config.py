@@ -88,3 +88,32 @@ def test_modules_alias_the_sm86_tables():
     assert pq2_small_mmq.RING_BY_M is pq2_tables.SM86.ring_by_m
     assert pq2_small_mmq.RING_EXACT is pq2_tables.SM86.ring_exact
     assert pq2_int_gemv._M1_CFG is pq2_tables.SM86.m1_cfg
+
+
+def test_table_override(tmp_path, monkeypatch):
+    """GGUF_PQ2_TABLES replaces / removes cells of the SM86 tables and sets OVERRIDE_HASH; without it nothing changes."""
+    import json
+    base = pq2_tables.SM86
+    data = {
+        "m1_triton": {"34816x5120": [8, 8, 1, 1], "5120x6144": None},
+        "gluon_small": {"4": {"34816x5120": [2, 2, 4, 1]}},           # moves a ring cell to the direct table
+        "gluon_ring": {"16": {"5120x6144": None}, "17": {"5120x6144": [4, 2, 4, 3, 1]}},
+        "gluon_exact": {"add": [[4, 34816, 5120]], "remove": [[2, 5120, 17408]]},
+        "gluon_prefill": {"5120x6144": [[1073741824, [4, 2, 4, 4, 2, 2]]], "5120x17408": None},
+    }
+    path = tmp_path / "override.json"
+    path.write_text(json.dumps(data))
+    t = pq2_tables._apply_override(base, json.loads(path.read_text()))
+    assert t.m1_triton[(34816, 5120)] == (8, 8, 1, 1) and (5120, 6144) not in t.m1_triton
+    assert t.gluon_small[4][(34816, 5120)] == (2, 2, 4, 1) and (34816, 5120) not in t.gluon_ring[4]
+    assert (5120, 6144) not in t.gluon_ring[16] and t.gluon_ring[17][(5120, 6144)] == (4, 2, 4, 3, 1)
+    assert (4, 34816, 5120) in t.gluon_exact and (2, 5120, 17408) not in t.gluon_exact
+    assert t.gluon_prefill[(5120, 6144)] == ((1 << 30, (4, 2, 4, 4, 2, 2)),) and (5120, 17408) not in t.gluon_prefill
+    # the base tables are not modified
+    assert (34816, 5120) in base.gluon_ring[4] and (5120, 6144) in base.m1_triton and (5120, 6144) in base.gluon_ring[16]
+    monkeypatch.setenv("GGUF_PQ2_TABLES", str(path))
+    reloaded = importlib.reload(pq2_tables)
+    assert reloaded.OVERRIDE_HASH and reloaded.SM86.m1_triton[(34816, 5120)] == (8, 8, 1, 1)
+    monkeypatch.delenv("GGUF_PQ2_TABLES")
+    reloaded = importlib.reload(pq2_tables)
+    assert reloaded.OVERRIDE_HASH == "" and reloaded.SM86.m1_triton[(34816, 5120)] == (16, 8, 4, 1)

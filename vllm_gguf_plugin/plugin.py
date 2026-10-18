@@ -158,7 +158,7 @@ def _register_pq2_compile_factors() -> None:
 
     from . import attention
     from .quantization import linear
-    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, prism, small_gemm
+    from .triton import pq2_config, pq2_int_gemv, pq2_mmq, pq2_small_mmq, pq2_tables, prism, small_gemm
 
     envs.environment_variables["GGUF_PQ2_PREPARED"] = lambda: (
         linear._EXPERIMENTAL_PREPARED_PQ2
@@ -173,6 +173,8 @@ def _register_pq2_compile_factors() -> None:
     # resolved on/off state all enter the compile identity.
     envs.environment_variables["GGUF_PQ2_KERNELS"] = lambda: pq2_config.KERNELS
     envs.environment_variables["GGUF_PQ2_KERNEL_VERSION"] = lambda: pq2_config.KERNEL_VERSION
+    # A per-card table override (GGUF_PQ2_TABLES, written by the A4000 tuner) changes the kernels' configurations.
+    envs.environment_variables["GGUF_PQ2_TABLES_HASH"] = lambda: pq2_tables.OVERRIDE_HASH
     for env_name, module, attr in (
         ("GGUF_PQ2_MMQ_TUNED_TILES", pq2_mmq, "_TUNED_TILES"),
         ("GGUF_PQ2_PREFILL_ROWS", pq2_mmq, "_QUANT_ROWS"),
