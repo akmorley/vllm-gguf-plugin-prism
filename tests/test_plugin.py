@@ -489,3 +489,27 @@ def test_gguf_linear_mixed_type_shards_quantize_activation_once(monkeypatch):
     assert out.shape == (17, 8)
     assert quantized == [] and prequantized == []
     assert plain == [((4, 176), 13), ((4, 210), 14)]
+
+
+def test_local_gguf_directory_ignores_hf_checkpoint_with_gguf_copy(tmp_path):
+    from vllm_gguf_plugin.plugin import _is_local_gguf_directory
+
+    gguf_only = tmp_path / "gguf"
+    gguf_only.mkdir()
+    (gguf_only / "model-Q8_0.gguf").write_bytes(b"")
+    assert _is_local_gguf_directory(str(gguf_only))
+
+    # a safetensors drafter shipping a llama.cpp copy (bonsai-dflash2 layout)
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text("{}")
+    (drafter / "model.safetensors").write_bytes(b"")
+    (drafter / "Drafter-Q8_0.gguf").write_bytes(b"")
+    assert not _is_local_gguf_directory(str(drafter))
+
+    hf_only = tmp_path / "hf"
+    hf_only.mkdir()
+    (hf_only / "config.json").write_text("{}")
+    (hf_only / "model.safetensors").write_bytes(b"")
+    assert not _is_local_gguf_directory(str(hf_only))
+    assert not _is_local_gguf_directory(None)

@@ -32,10 +32,19 @@ def _is_gguf_reference(model: str | None) -> bool:
 
 
 def _is_local_gguf_directory(model: str | None) -> bool:
+    """A local directory holding a GGUF model and no Hugging Face checkpoint.
+
+    Drafter repositories can ship a llama.cpp copy next to the safetensors
+    checkpoint (bonsai-dflash2 has Bonsai-2-27B-DFlash2-Q8_0.gguf); those load
+    from config.json and the safetensors, not as GGUF.
+    """
     if not model:
         return False
     path = Path(model)
-    return path.is_dir() and any(path.glob("*.gguf"))
+    if not path.is_dir() or not any(path.glob("*.gguf")):
+        return False
+    hf_weights = any(path.glob("*.safetensors")) or any(path.glob("pytorch_model*.bin"))
+    return not ((path / "config.json").is_file() and hf_weights)
 
 
 def _get_gguf_config_source(
